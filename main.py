@@ -757,12 +757,10 @@ class DrowsinessApp:
         return self._last_position or self._advisor_position()
 
     def _agent_rag(self):
-        if self.rag_service is None:
-            try:
-                self.rag_service = RAGService()
-            except Exception:
-                return None
-        return self.rag_service
+        try:
+            return self._get_rag_service()
+        except Exception:
+            return None
 
     # ================================================================ TRANG GIAM SAT
     def build_monitor(self, page):
@@ -1165,6 +1163,7 @@ class DrowsinessApp:
                                "). Hãy chạy: pip install -r requirements.txt")
         if self.rag_service is None:
             self.rag_service = RAGService()
+            self.rag_service.position_getter = route_map.locate_precise   # vi tri cho cau hoi thoi tiet
         return self.rag_service
 
     def _rag_boot(self):
@@ -1197,6 +1196,20 @@ class DrowsinessApp:
         self._rag_set_busy(False, message)
         self._rag_update_status()
         self._rag_refresh_docs()
+        self._rag_location_hint()
+
+    def _rag_location_hint(self):
+        """Nhac bat dinh vi ngay khi mo trang tro ly, de hoi thoi tiet khong can noi dia diem."""
+        def show(hint):
+            self._rag_write("Hệ thống\n", "who_bot")
+            self._rag_write(hint + "\n", "sys")
+
+        def worker():
+            loc, hint = route_map.locate_precise()
+            if not loc:
+                self.ui.post(lambda h=hint: show(h))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _rag_update_status(self):
         svc = self.rag_service

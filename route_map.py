@@ -20,8 +20,14 @@ import serial.tools.list_ports
 
 import asyncio
 
+LOCATE_STATUS = "ok"      # ly do dinh vi that bai gan nhat: ok | denied | no_fix | unsupported
+LOCATE_TIMEOUT_S = 10
+
+
 def locate_by_windows():
-    """Lay vi tri tu Windows Location, co the su dung Wi-Fi."""
+    """Lay vi tri tu Windows Location, co the su dung Wi-Fi.
+    Tra ve None neu that bai; ly do nam o LOCATE_STATUS."""
+    global LOCATE_STATUS
     try:
         from winsdk.windows.devices.geolocation import (
             Geolocator,
@@ -32,23 +38,33 @@ def locate_by_windows():
             permission = await Geolocator.request_access_async()
 
             if permission != GeolocationAccessStatus.ALLOWED:
-                return None
+                return None, "denied"
 
             locator = Geolocator()
-            position = await locator.get_geoposition_async()
+            position = await asyncio.wait_for(
+                locator.get_geoposition_async(), LOCATE_TIMEOUT_S
+            )
 
             coords = position.coordinate.point.position
 
             return {
                 "lat": coords.latitude,
                 "lon": coords.longitude,
-            }
+                "source": "Windows Location",
+            }, "ok"
 
-        return asyncio.run(get_position())
+        result, LOCATE_STATUS = asyncio.run(get_position())
+        return result
 
+    except ImportError:
+        LOCATE_STATUS = "unsupported"
+    except asyncio.TimeoutError:
+        LOCATE_STATUS = "no_fix"
     except Exception as e:
+        LOCATE_STATUS = "denied"
         print(f"Windows Location loi: {e}")
-        return None
+    return None
+
 
 def parse_nmea_coordinate(value, direction):
     """Chuyen toa do NMEA sang so thap phan."""
@@ -239,10 +255,10 @@ def locate_by_ip():
 
 
 
-def auto_locate():
+def auto_locate(allow_ip=True):
     """
     Uu tien Windows Location (Wi-Fi),
-    sau do GPS USB, cuoi cung la IP.
+    sau do GPS USB, cuoi cung la IP (bo qua neu allow_ip=False).
     """
 
     # 1. Dinh vi bang Windows
@@ -257,9 +273,54 @@ def auto_locate():
         print("Da lay vi tri tu GPS")
         return result
 
-    # 3. Phuong an du phong: IP
+    # 3. Phuong an du phong: IP (khong chinh xac, hay sai thanh pho)
+    if not allow_ip:
+        return None
     print("Khong co vi tri Windows/GPS, thu dinh vi IP")
     return locate_by_ip()
+
+
+LOCATION_HELP = {
+    "denied": (
+        "Mình chưa lấy được vị trí vì định vị trên máy đang tắt hoặc chưa cho phép ứng dụng. "
+        "Bạn bật như sau nhé:\n"
+        "1. Mở Cài đặt Windows → Quyền riêng tư & bảo mật → Vị trí "
+        "(Windows 10: Cài đặt → Quyền riêng tư → Vị trí).\n"
+        "2. Bật «Dịch vụ vị trí» (Location services).\n"
+        "3. Bật «Cho phép ứng dụng truy cập vị trí của bạn», và bật cả «Cho phép ứng dụng trên máy tính "
+        "truy cập vị trí của bạn» (Let desktop apps access your location), vì đây là ứng dụng máy tính.\n"
+        "4. Hỏi lại mình về thời tiết.\n"
+        "Hoặc bạn cứ nói tên tỉnh/thành, ví dụ «thời tiết Đà Nẵng»."
+    ),
+    "no_fix": (
+        "Mình chưa nhận được tín hiệu định vị. Nếu dùng GPS USB, hãy cắm thiết bị, đưa ra nơi thoáng "
+        "và chờ vài phút để bắt tín hiệu; nếu dùng định vị của Windows, hãy kiểm tra mạng đang bật "
+        "và «Dịch vụ vị trí» đã mở. Hoặc bạn nói tên tỉnh/thành, ví dụ «thời tiết Đà Nẵng»."
+    ),
+    "unsupported": (
+        "Máy này chưa có nguồn định vị khả dụng (Windows Location hoặc GPS USB). "
+        "Bạn có thể nói tên tỉnh/thành để mình xem thời tiết, ví dụ «thời tiết Đà Nẵng»."
+    ),
+}
+
+_precise = {"t": 0.0, "loc": None}
+_precise_lock = threading.Lock()
+
+
+def locate_precise(max_age=120):
+    """
+    Vi tri cho tro ly (thoi tiet...): Windows Location -> GPS USB, KHONG dung IP.
+    Tra ve (vi_tri | None, huong_dan). huong_dan chi co noi dung khi vi_tri la None.
+    Chi luu dem khi thanh cong, nen vua bat dinh vi xong la hoi lai duoc ngay.
+    """
+    with _precise_lock:
+        if _precise["loc"] and time.time() - _precise["t"] < max_age:
+            return _precise["loc"], ""
+        loc = auto_locate(allow_ip=False)
+        if loc:
+            _precise.update(t=time.time(), loc=loc)
+            return loc, ""
+        return None, LOCATION_HELP.get(LOCATE_STATUS, LOCATION_HELP["denied"])
 
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
