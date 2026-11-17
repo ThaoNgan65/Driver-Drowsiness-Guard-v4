@@ -62,6 +62,11 @@ MAR_THRESHOLD = 0.65
 YAWN_TIME_LIMIT = 0.9
 BEEP_INTERVAL = 0.2
 FACE_LOST_GRACE = 0.7
+NORMAL_STABLE_SEC = 1.5          # dữ liệu ổn định liên tục mới về NORMAL
+OCCLUSION_DEGRADED_CONFIRM_FRAMES = 3  # lớp xác nhận thứ hai sau tracker cấu trúc
+OCCLUSION_DEGRADED_CONFIRM_SEC = 0.12  # chống nhấp nháy ở frame bất thường thoáng qua
+DEGRADED_BEEP_AFTER = 1.5        # giây ở DEGRADED trước khi phát âm thanh nhắc
+DEGRADED_BEEP_COOLDOWN = 2.5     # khoảng cách tối thiểu giữa các beep DEGRADED
 
 PITCH_HIGH = 0.40
 YAW_HIGH = 0.35
@@ -91,9 +96,13 @@ NOD_DWELL_NOISY = 0.25      # khi frame nhiễu (rung): giữ lâu hơn mới đ
 EAR_SMOOTH_ALPHA = 0.45
 OPEN_RESET_FRAMES = 4
 
-SUNGLASS_RATIO_NORMAL = 0.62
-SUNGLASS_RATIO_LOWLIGHT = 0.48
-SUNGLASS_CONFIRM_FRAMES = 5
+# Che miệng chỉ dùng để ngăn MAR báo ngáp giả
+OCCLUSION_CONFIRM_FRAMES = 8
+ROI_STRUCTURE_MIN = 12.0
+OCCLUSION_SKIN_MIN = 35.0
+# Che mắt được xác nhận bằng so sánh cấu trúc ROI theo thời gian
+EYE_OCC_CONFIRM_FRAMES = 3
+EYE_EAR_OPEN = 0.14
 
 CAM_FAIL_REOPEN = 30
 
@@ -144,13 +153,18 @@ def setup_error_logger():
 log = setup_error_logger()
 
 
+_BEEP_LOCK = threading.Lock()
+
+
 def beep_async(freq, dur):
-    """winsound.Beep chan luong -> chay thread rieng."""
+    """Phat beep ngoai luong; khoa chung de cac canh bao khong chong am."""
     def worker():
-        try:
-            winsound.Beep(freq, dur)
-        except Exception as e:
-            log.warning("Beep failed: %s", e)
+        # Cho am thanh truoc ket thuc, nhung khong khoa vong lap camera/nhan dien.
+        with _BEEP_LOCK:
+            try:
+                winsound.Beep(freq, dur)
+            except Exception as e:
+                log.warning("Beep failed: %s", e)
     threading.Thread(target=worker, daemon=True).start()
 
 
@@ -158,7 +172,30 @@ def euclidean_distance(p1, p2):
     return np.linalg.norm(np.array(p1) - np.array(p2))
 
 
+def eye_landmarks_valid(landmarks, eye_indices, w, h):
+    """Kiem tra tinh hop le hinh hoc cua 6 landmark; khong suy dien che mat.
+
+    Mắt nhắm vẫn hợp lệ vì khoảng cách mí trên/dưới có thể gần 0.
+    Hàm này chỉ loại tọa độ lỗi/ngoài ảnh hoặc hai khóe mắt trùng nhau.
+    """
+    try:
+        pts = np.asarray([(landmarks[i].x * w, landmarks[i].y * h)
+                          for i in eye_indices], dtype=np.float64)
+        if pts.shape != (6, 2) or not np.isfinite(pts).all():
+            return False
+        if np.any(pts[:, 0] < 0) or np.any(pts[:, 0] >= w):
+            return False
+        if np.any(pts[:, 1] < 0) or np.any(pts[:, 1] >= h):
+            return False
+        # Chiều rộng giữa hai khóe mắt phải có thể đo được; không yêu cầu
+        # khoảng mở mí nên không loại nhắm mắt/chớp mắt.
+        return euclidean_distance(pts[0], pts[3]) > 1e-6
+    except (IndexError, AttributeError, TypeError, ValueError):
+        return False
+
+
 def eye_aspect_ratio(landmarks, eye_indices, w, h):
+    # Giữ nguyên công thức EAR; tính hợp lệ landmark là bước riêng biệt.
     pts = [(landmarks[i].x * w, landmarks[i].y * h) for i in eye_indices]
     v1 = euclidean_distance(pts[1], pts[5])
     v2 = euclidean_distance(pts[2], pts[4])
@@ -244,22 +281,396 @@ def roi_gray_mean(bgr, landmarks, indices, w, h, pad=3):
     return float(np.mean(g))
 
 
-def is_sunglasses_relative(bgr, landmarks, w, h, ratio_max):
-    left_m = roi_gray_mean(bgr, landmarks, LEFT_EYE, w, h)
-    right_m = roi_gray_mean(bgr, landmarks, RIGHT_EYE, w, h)
-    skin_m = roi_gray_mean(bgr, landmarks, SKIN_REF, w, h, pad=6)
-    if left_m is None or right_m is None or skin_m is None or skin_m < 1.0:
-        return False
-    eye_m = (left_m + right_m) / 2.0
-    return (eye_m / skin_m) < ratio_max
-
-
 def eyes_overexposed(bgr, landmarks, w, h):
     m1 = roi_gray_mean(bgr, landmarks, LEFT_EYE, w, h, pad=4)
     m2 = roi_gray_mean(bgr, landmarks, RIGHT_EYE, w, h, pad=4)
     if m1 is None or m2 is None:
         return False
     return ((m1 + m2) * 0.5) >= GLARE_EYE_MEAN_MIN
+
+
+# Điểm quan trọng để kiểm tra mặt bị cắt / che: mũi, mắt ngoài, khóe miệng, cằm
+
+def _roi_laplacian_var(bgr, landmarks, indices, w, h, pad=4):
+    xs = [int(landmarks[i].x * w) for i in indices]
+    ys = [int(landmarks[i].y * h) for i in indices]
+    if not xs:
+        return None
+    x1, x2 = max(0, min(xs) - pad), min(w - 1, max(xs) + pad)
+    y1, y2 = max(0, min(ys) - pad), min(h - 1, max(ys) + pad)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return None
+    gray = cv2.cvtColor(bgr[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+class PoseAwareEyeOcclusionTracker:
+    """Phat hien che mat bang bang chung cau truc da vung, chong bien doi anh sang.
+
+    Do sang/contrast/Laplacian khong bao gio la bang chung doc lap. Tracker
+    doi chieu cau truc theo tung o, do ben vung cua texture va yeu cau nhieu
+    frame lien tiep truoc khi xac nhan.
+    """
+    def __init__(self, confirm_frames=5, similarity_min=0.68):
+        self.confirm_frames = max(5, int(confirm_frames))
+        self.similarity_min = float(similarity_min)
+        self.states = {tuple(LEFT_EYE): self._new_state(),
+                       tuple(RIGHT_EYE): self._new_state()}
+        self.last_diagnostics = []
+        self.last_selected_eyes = []
+        self.last_occluded_eyes = []
+        self.last_unavailable_eyes = []
+        self.both_eyes_clear = False
+        self.any_eye_clear = False
+
+    @staticmethod
+    def _new_state():
+        return {"ref": None, "ref_texture": None, "yaw": None, "pitch": None,
+                "width": None, "bad": 0,
+                "occluded": False, "warmup": 0, "diag_count": 0}
+
+    def reset(self):
+        for key in self.states:
+            self.states[key] = self._new_state()
+        self.last_diagnostics = []
+        self.last_selected_eyes = []
+        self.last_occluded_eyes = []
+        self.last_unavailable_eyes = []
+        self.both_eyes_clear = False
+        self.any_eye_clear = False
+
+    def _patch(self, frame, landmarks, eye_indices, w, h):
+        pts = np.asarray([(landmarks[i].x * w, landmarks[i].y * h)
+                          for i in eye_indices], dtype=np.float32)
+        if pts.shape != (6, 2) or not np.isfinite(pts).all():
+            return None, None, {"valid": False, "reason": "invalid_landmarks"}
+        width = float(np.linalg.norm(pts[3] - pts[0]))
+        if width < 7.0:
+            return None, width, {"valid": False, "reason": "roi_too_small"}
+        top = (pts[1] + pts[2]) * 0.5
+        bottom = (pts[4] + pts[5]) * 0.5
+        # ROI that truoc day chi noi suy tu 4 diem nam tren duong vien mat,
+        # mac du duoc gan nhan "expanded". Mo rong theo truc mat de lay ca
+        # long may, mi duoi, thai duong va phan gong/trong kinh vuot khoi vien.
+        eye_axis = pts[3] - pts[0]
+        axis_len = float(np.linalg.norm(eye_axis))
+        unit_x = eye_axis / max(axis_len, 1e-6)
+        unit_y = np.asarray([-unit_x[1], unit_x[0]], dtype=np.float32)
+        if float(np.dot(bottom - top, unit_y)) < 0:
+            unit_y = -unit_y
+        center = (pts[0] + pts[3] + top + bottom) * 0.25
+        half_width = axis_len * 0.95
+        half_height = max(float(np.linalg.norm(bottom - top)) * 0.5 + axis_len * 0.38,
+                          axis_len * 0.62)
+        src4 = np.asarray([
+            center - unit_x * half_width,
+            center - unit_y * half_height,
+            center + unit_x * half_width,
+            center + unit_y * half_height,
+        ], dtype=np.float32)
+        dst4 = np.asarray([[0, 32], [48, 0], [95, 32], [48, 63]], dtype=np.float32)
+        matrix = cv2.getPerspectiveTransform(src4, dst4)
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        raw = cv2.warpPerspective(gray, matrix, (96, 64),
+                                  flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REPLICATE)
+        raw_std = float(np.std(raw))
+        clipped_ratio = float(np.mean((raw <= 5) | (raw >= 250)))
+        # Ban do pixel toi theo Otsu tren toan ROI (4x4 o), chi de debug.
+        # Ban do nay khong tu minh quyet dinh kinh ram/che mat.
+        _, dark_mask = cv2.threshold(
+            raw, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
+        )
+        dark_distribution = tuple(
+            int(round(float(np.mean(dark_mask[gy * 16:(gy + 1) * 16,
+                                              gx * 24:(gx + 1) * 24])) / 255.0 * 100))
+            for gy in range(4) for gx in range(4)
+        )
+
+        # Chuan hoa illumination nen cham de loai bo bong do/exposure gradient.
+        x = raw.astype(np.float32) + 1.0
+        illumination = cv2.GaussianBlur(x, (0, 0), sigmaX=8.0, sigmaY=5.0)
+        corrected = x / np.maximum(illumination, 2.0)
+        lo, hi = np.percentile(corrected, (1, 99))
+        if hi - lo > 1e-5:
+            corrected = (corrected - lo) * (255.0 / (hi - lo))
+        else:
+            corrected = np.zeros_like(corrected)
+        patch = np.clip(corrected, 0, 255).astype(np.uint8)
+        patch = cv2.createCLAHE(clipLimit=1.35, tileGridSize=(4, 4)).apply(patch)
+        # Chi danh dau mat thong tin khi patch gan nhu khong con bien thien
+        # hoac bi clipping gan toan bo. Muc clipping vua phai/contrast thap
+        # van co the duoc CLAHE + chuan hoa nen phuc hoi de so sanh cau truc.
+        quality = {"valid": True, "raw_std": raw_std,
+                   "clipped_ratio": clipped_ratio,
+                   "photometric_limited": clipped_ratio >= 0.85 or raw_std < 2.0,
+                   "dark_distribution": dark_distribution,
+                   "roi": "expanded_eye_periocular"}
+        return patch, width, quality
+
+    @staticmethod
+    def _normalize_structure(patch):
+        x = patch.astype(np.float32)
+        x = x - cv2.GaussianBlur(x, (0, 0), 2.2)
+        scale = float(np.percentile(np.abs(x), 90)) + 1e-4
+        return np.clip(x / scale, -3.0, 3.0)
+
+    @classmethod
+    def _similarity_details(cls, a, b):
+        if a is None or b is None or a.shape != b.shape:
+            return {"score": -1.0, "ncc": -1.0, "orientation": 0.0,
+                    "edge_iou": 0.0, "bad_cells": 16}
+        an, bn = cls._normalize_structure(a), cls._normalize_structure(b)
+        pad_a = cv2.copyMakeBorder(an, 2, 2, 3, 3, cv2.BORDER_REFLECT_101)
+        ncc = float(np.clip(cv2.matchTemplate(
+            pad_a, bn, cv2.TM_CCOEFF_NORMED).max(), -1.0, 1.0))
+        ax = cv2.Sobel(an, cv2.CV_32F, 1, 0, ksize=3)
+        ay = cv2.Sobel(an, cv2.CV_32F, 0, 1, ksize=3)
+        bx = cv2.Sobel(bn, cv2.CV_32F, 1, 0, ksize=3)
+        by = cv2.Sobel(bn, cv2.CV_32F, 0, 1, ksize=3)
+        amag, bmag = cv2.magnitude(ax, ay), cv2.magnitude(bx, by)
+        threshold = max(float(np.percentile(amag, 45)),
+                        float(np.percentile(bmag, 45)), 1e-3)
+        valid = (amag > threshold * 0.35) & (bmag > threshold * 0.35)
+        if int(valid.sum()) >= 16:
+            dot = ax[valid] * bx[valid] + ay[valid] * by[valid]
+            denom = amag[valid] * bmag[valid] + 1e-5
+            orientation = float((np.mean(np.clip(dot / denom, -1, 1)) + 1) * 0.5)
+        else:
+            orientation = 0.5
+        active_a, active_b = amag > threshold * 0.35, bmag > threshold * 0.35
+        union = int(np.logical_or(active_a, active_b).sum())
+        edge_iou = (float(np.logical_and(active_a, active_b).sum()) / union
+                    if union else 1.0)
+        score = (0.55 * (0.55 * ((ncc + 1.0) * 0.5) + 0.45 * orientation)
+                 + 0.45 * edge_iou)
+
+        # Chi tinh o co texture trong anh tham chieu va nam quanh mat;
+        # vung da/long may it texture khong duoc tinh la bang chung bi che.
+        bad_cells = 0
+        cell_h, cell_w = an.shape[0] // 4, an.shape[1] // 4
+        for gy in (1, 2):
+            for gx in range(4):
+                ya, yb = gy * cell_h, (gy + 1) * cell_h
+                xa, xb = gx * cell_w, (gx + 1) * cell_w
+                aa, bb = an[ya:yb, xa:xb].ravel(), bn[ya:yb, xa:xb].ravel()
+                ref_std, cur_std = float(np.std(aa)), float(np.std(bb))
+                if ref_std < 0.08:
+                    continue
+                if cur_std < 0.08:
+                    bad_cells += 1
+                else:
+                    corr = float(np.corrcoef(aa, bb)[0, 1])
+                    if not np.isfinite(corr) or corr < 0.30:
+                        bad_cells += 1
+        return {"score": float(score), "ncc": ncc,
+                "orientation": float(orientation), "edge_iou": edge_iou,
+                "bad_cells": bad_cells}
+
+    @staticmethod
+    def _texture_energy(patch):
+        x = patch.astype(np.float32)
+        return float(np.std(x - cv2.GaussianBlur(x, (0, 0), 2.0)))
+
+    def _log_diagnostic(self, message):
+        try:
+            logging.getLogger("drowsiness").info("EYE_OCCLUSION %s", message)
+        except Exception:
+            pass
+
+    def update(self, frame, landmarks, w, h, yaw, pitch, left_ear, right_ear):
+        if yaw > YAW_EXTREME:
+            selected = [(LEFT_EYE, left_ear, right_ear)]
+        elif yaw < -YAW_EXTREME:
+            selected = [(RIGHT_EYE, right_ear, left_ear)]
+        else:
+            selected = [(LEFT_EYE, left_ear, right_ear),
+                        (RIGHT_EYE, right_ear, left_ear)]
+
+        diagnostics = []
+        selected_names = []
+        unavailable_names = []
+        valid_patch_names = []
+        closed_names = []
+        reliable_open_names = []
+        for indices, ear, other_ear in selected:
+            key = tuple(indices)
+            eye_name = "left" if key == tuple(LEFT_EYE) else "right"
+            selected_names.append(eye_name)
+            state = self.states[key]
+            was_occluded = state["occluded"]
+            patch, width, quality = self._patch(frame, landmarks, indices, w, h)
+            if patch is None:
+                state["bad"] = 0
+                reason = quality.get('reason', 'unknown')
+                diagnostics.append(f"{eye_name}:roi_invalid:{reason}")
+                unavailable_names.append(eye_name)
+                self._log_diagnostic(f"{eye_name}:ROI_UNAVAILABLE reason={reason} width={width} confirmed_occluded={state['occluded']}")
+                continue
+            valid_patch_names.append(eye_name)
+            eye_closed = ear < EYE_EAR_OPEN
+            if eye_closed:
+                # ROI va landmark van quan sat duoc; EAR thap la mat nham,
+                # khong phai mat bi che hay mat du lieu.
+                closed_names.append(eye_name)
+
+            pose_changed = (state["yaw"] is not None and
+                            (abs(yaw - state["yaw"]) > 0.20 or
+                             abs(pitch - state["pitch"]) > 0.20 or
+                             abs(width / max(state["width"], 1e-3) - 1.0) > 0.25))
+            if pose_changed:
+                # Xac nhan che duoc tao tu mau tham chieu cua tu the cu.
+                # Khi yaw/pitch/scale doi dang ke, ket qua cu khong con hop le
+                # cho ROI moi. Khong mang co occluded qua pose moi, vi no co the
+                # khoa EAR/DEGRADED du landmark va EAR hien tai van hop le.
+                self._log_diagnostic(
+                    f"{eye_name} reset_reference=pose_change_clear_stale_occlusion "
+                    f"previous_occluded={was_occluded} yaw={yaw:.3f} "
+                    f"pitch={pitch:.3f} width={width:.1f}")
+                self.states[key] = state = self._new_state()
+            if state["yaw"] is None:
+                state["yaw"], state["pitch"], state["width"] = yaw, pitch, width
+
+            if state["ref"] is None:
+                if ear >= EYE_EAR_OPEN:
+                    state["warmup"] += 1
+                    if state["warmup"] >= 4:
+                        state["ref"] = patch.copy()
+                        state["ref_texture"] = self._texture_energy(patch)
+                        self._log_diagnostic(
+                            f"{eye_name} reference_learned texture={state['ref_texture']:.2f} "
+                            f"raw_std={quality['raw_std']:.2f}")
+                else:
+                    diagnostics.append(f"{eye_name}:reference_waiting")
+                continue
+
+            detail = self._similarity_details(state["ref"], patch)
+            score = detail["score"]
+            ref_texture = max(float(state["ref_texture"] or 0.0), 1e-3)
+            texture_now = self._texture_energy(patch)
+            texture_ratio = texture_now / ref_texture
+
+            # Khong dung texture-energy (gan voi do tuong phan/Laplacian) lam
+            # bang chung mat du lieu: toi/sang/chinh gamma co the lam chi so nay doi.
+            # Xac nhan che can dong thoi co sai khac theo nhieu o va hinh hoc canh
+            # khong con khop; NCC thap hoac edge-IoU thap giup tach vat che khoi
+            # thay doi phoi sang/bong do. Khong sua nguong EAR hay logic pose.
+            localized_change = detail["bad_cells"] >= 3
+            edge_structure_lost = detail["edge_iou"] < 0.72
+            spatial_correlation_lost = detail["ncc"] < 0.50
+            structural_changed = (
+                not quality["photometric_limited"]
+                and localized_change
+                and score < (self.similarity_min + 0.06)
+                and (edge_structure_lost or spatial_correlation_lost)
+            )
+            photometric_only = (score < self.similarity_min and
+                                not structural_changed)
+
+            if eye_closed:
+                # Mí khép/chớp mắt không phải bằng chứng che; tạm ngưng đánh giá
+                # ROI này và không để cờ che cũ của nó gây DEGRADED trong frame này.
+                state["bad"] = 0
+            else:
+                evidence = structural_changed
+                if evidence:
+                    state["bad"] += 1
+                    if state["bad"] >= self.confirm_frames:
+                        state["occluded"] = True
+                else:
+                    state["bad"] = 0
+                    if state["occluded"] and not quality["photometric_limited"]:
+                        # Khong con bang chung che va ROI du chat luong:
+                        # hoc lai mau hien tai thay cho reference cu bi loi thoi.
+                        state["ref"] = patch.copy()
+                        state["ref_texture"] = texture_now
+                        state["occluded"] = False
+                    elif not state["occluded"] and score >= self.similarity_min + 0.10:
+                        state["ref"] = cv2.addWeighted(state["ref"], 0.992, patch, 0.008, 0)
+                        state["ref_texture"] = (0.992 * ref_texture + 0.008 * texture_now)
+
+            state["diag_count"] += 1
+            if photometric_only:
+                why = "photometric_change_not_occlusion"
+            elif structural_changed:
+                why = "structural_occlusion_candidate"
+            elif quality["photometric_limited"]:
+                why = "low_visual_quality_hold"
+            else:
+                why = "structure_consistent"
+            diag = (f"{eye_name}:{why}:roi=expanded_eye_periocular,score={score:.3f},"
+                    f"ncc={detail['ncc']:.3f},orient={detail['orientation']:.3f},"
+                    f"edge_iou={detail['edge_iou']:.3f},"
+                    f"bad_cells={detail['bad_cells']},texture_ratio={texture_ratio:.3f},"
+                    f"dark_map={quality['dark_distribution']},"
+                    f"raw_std={quality['raw_std']:.2f},clip={quality['clipped_ratio']:.2f},"
+                    f"ear={ear:.3f},other_ear={other_ear:.3f},bad={state['bad']},"
+                    f"eye_closed={eye_closed},confirmed={state['occluded']}")
+            diagnostics.append(diag)
+
+            # Log khi bat dau nghi ngo, dinh ky trong episode, va moi lan doi trang thai.
+            if (score < self.similarity_min or quality["photometric_limited"]
+                    or (evidence if not eye_closed else False)):
+                if (state["diag_count"] == 1 or state["diag_count"] % 15 == 0
+                        or state["occluded"] != was_occluded):
+                    self._log_diagnostic(diag)
+            elif state["occluded"] != was_occluded:
+                self._log_diagnostic(f"{eye_name}:RECOVERED score={score:.3f}")
+            if state["occluded"] and not was_occluded:
+                self._log_diagnostic(f"{eye_name}:CONFIRMED_OCCLUSION {diag}")
+            elif was_occluded and not state["occluded"]:
+                self._log_diagnostic(f"{eye_name}:OCCLUSION_CLEARED {diag}")
+            if state["occluded"] and not eye_closed:
+                unavailable_names.append(eye_name)
+            elif (state["ref"] is not None and ear >= EYE_EAR_OPEN
+                  and score >= self.similarity_min + 0.08):
+                reliable_open_names.append(eye_name)
+
+        self.last_diagnostics = diagnostics
+        self.last_selected_eyes = selected_names
+        # Chi tinh trang thai cua mat dang duoc su dung o tu the hien tai;
+        # mat xa bi khuất tu nhien khi quay dau khong duoc ke thua co cu de
+        # lam mat con lai (dang quan sat duoc) bi DEGRADED.
+        active_names = set(selected_names)
+        latched_occluded = []
+        for eye_name, indices in (("left", LEFT_EYE), ("right", RIGHT_EYE)):
+            if eye_name in active_names and self.states[tuple(indices)]["occluded"]:
+                latched_occluded.append(eye_name)
+        current_occluded = (set(latched_occluded) & set(valid_patch_names)) - set(closed_names)
+        self.last_occluded_eyes = sorted(current_occluded)
+        self.last_unavailable_eyes = sorted(set(unavailable_names))
+        # Xac nhan cac mat dang duoc su dung o pose hien tai. Khi yaw cuc dai,
+        # mat xa khong duoc chon de tinh EAR nen khong duoc phep khoa phuc hoi.
+        # Moi ROI duoc cap nhat lai trong update() o tung frame; chi mat co
+        # cau truc khop, EAR mo va khong con co occluded moi duoc xem la clear.
+        self.both_eyes_clear = (
+            bool(selected_names)
+            and set(reliable_open_names) == set(selected_names)
+            and not current_occluded
+        )
+        # Một mắt rõ và đáng tin cậy đủ duy trì theo dõi khi mắt kia khuất
+        # tự nhiên hoặc ROI mắt kia không dùng được ở góc quay hiện tại.
+        # Mat dang nham van la mat quan sat duoc neu ROI/landmark hien tai hop le;
+        # dieu nay cho phep tiep tuc tinh EAR khi mat con lai bi che.
+        self.any_eye_clear = bool(reliable_open_names or closed_names)
+        both_current_eyes_confirmed_occluded = (
+            set(selected_names) == {"left", "right"}
+            and set(valid_patch_names) == {"left", "right"}
+            and current_occluded == {"left", "right"}
+            and not closed_names
+        )
+        return both_current_eyes_confirmed_occluded
+
+def assess_mouth_coverage(bgr, landmarks, w, h):
+    """Chỉ kiểm tra miệng để tránh MAR/ngáp giả; không ảnh hưởng trạng thái mắt."""
+    skin_m = roi_gray_mean(bgr, landmarks, SKIN_REF, w, h, pad=6)
+    if skin_m is not None and skin_m < OCCLUSION_SKIN_MIN:
+        return False
+    mouth_s = _roi_laplacian_var(bgr, landmarks, MOUTH, w, h, pad=5)
+    skin_s = _roi_laplacian_var(bgr, landmarks, SKIN_REF, w, h, pad=6)
+    return (mouth_s is not None and mouth_s < ROI_STRUCTURE_MIN * 0.5
+            and (skin_s is None or skin_s >= ROI_STRUCTURE_MIN * 0.9))
+
 
 def is_color_obstructed(bgr):
     """
@@ -767,7 +1178,8 @@ class DrowsinessApp:
         page.grid_rowconfigure(2, weight=1)
 
         def right(h):
-            self.status_pill = T.Pill(h, "ĐÃ DỪNG", "idle")
+            # Width cố định để đổi trạng thái không làm giật layout header
+            self.status_pill = T.Pill(h, "ĐÃ DỪNG", "idle", width=132)
             self.status_pill.pack(side="left", padx=(0, 14))
             self.btn_toggle = ctk.CTkButton(
                 h, text="▶  Bắt đầu giám sát", width=210, height=44, corner_radius=12,
@@ -784,8 +1196,9 @@ class DrowsinessApp:
         self.banner.grid(row=1, column=0, sticky="ew", pady=(0, 14))
         self.banner.grid_propagate(False)
         self.banner_label = ctk.CTkLabel(
-            self.banner, text="", font=T.font(14, "bold"), text_color=T.C["muted"], anchor="w")
-        self.banner_label.pack(fill="both", expand=True, padx=18)
+            self.banner, text="", font=T.font(14, "bold"), text_color=T.C["muted"],
+            anchor="w", justify="left")
+        self.banner_label.pack(fill="both", expand=True, padx=18, pady=0)
         self._set_banner("Nhấn «Bắt đầu giám sát» để khởi động camera.", "idle")
 
         body = ctk.CTkFrame(page, fg_color="transparent")
@@ -845,6 +1258,8 @@ class DrowsinessApp:
         ]):
             t = T.Tile(grid, label, compact=True)
             t.grid(row=i // 2, column=i % 2, sticky="ew", padx=4, pady=3)
+            # Cố định chỗ hiển thị giá trị để đổi "skip"/số không làm co giãn ô
+            t.value_label.configure(width=11, anchor="w")
             self.tiles[key] = t
 
         for text, attr in (("Tiến độ nhắm mắt", "eye_bar"), ("Tiến độ ngáp", "yawn_bar")):
@@ -866,6 +1281,9 @@ class DrowsinessApp:
         self._video_size = (w, h)
 
     def _set_banner(self, text, kind):
+        # Giới hạn độ dài để không làm banner giật / tràn
+        if len(text) > 72:
+            text = text[:69] + "…"
         if self._banner_state == (text, kind):
             return
         self._banner_state = (text, kind)
@@ -874,11 +1292,17 @@ class DrowsinessApp:
             "ok": (T.C["ok_bg"], T.C["ok"], T.C["ok"]),
             "warn": (T.C["warn_bg"], T.C["warn"], T.C["warn"]),
             "danger": (T.C["danger_bg"], T.C["danger"], "#ff8a8a"),
+            "info": ("#10223d", T.C["info"], T.C["info"]),
         }[kind]
         self.banner.configure(fg_color=fg, border_color=border)
         self.banner_label.configure(text=text, text_color=color)
 
     def _pill(self, text, kind, detail=""):
+        # Tránh cập nhật không cần thiết → giảm giật layout
+        if getattr(self.status_pill, "_kind", None) == kind and self.status_pill.cget("text") == text:
+            if getattr(self, "mini", None) is not None and detail:
+                self.mini.set_pill(text, kind, detail)
+            return
         self.status_pill.set(text, kind)
         if getattr(self, "mini", None) is not None:
             self.mini.set_pill(text, kind, detail)
@@ -1725,6 +2149,7 @@ class DrowsinessApp:
         prev_time = time.time()
         prev_gray = None
         fail_reads = 0
+        last_camera_beep = 0.0
 
         eye_closed_start = None
         yawn_start = None
@@ -1743,7 +2168,9 @@ class DrowsinessApp:
         deep_start = None
         deep_duration = 0.0
         was_in_deep_pose = False
-        sunglass_streak = 0
+        occlusion_streak = 0
+        occlusion_reason = ""
+        eye_occlusion_tracker = PoseAwareEyeOcclusionTracker()
         ear_smooth = 0.0
         ear_smooth_ready = False
         open_streak = 0
@@ -1751,6 +2178,14 @@ class DrowsinessApp:
         alert_active = False
         alert_start_ts = 0.0
         alert_reasons_snap = []
+        normal_stable_start = None   # thời gian dữ liệu đáng tin cậy liên tục trước khi phục hồi
+        eye_occlusion_recovery = False
+        degraded_since = None        # thời điểm vào DEGRADED
+        last_degraded_beep = 0.0
+        # Lớp Temporal Validation ở cổng trạng thái: không để một kết quả
+        # tracker/landmark bất thường đơn lẻ đẩy hệ thống vào DEGRADED.
+        eye_occ_degraded_streak = 0
+        eye_occ_degraded_since = None
 
         try:
             while self.running and not self.system_error:
@@ -1780,10 +2215,24 @@ class DrowsinessApp:
                     if self._obstructed_since is None:
                         self._obstructed_since = time.time()
                     elif time.time() - self._obstructed_since >= OBSTRUCTED_HOLD_SEC:
-                        self.camera_obstructed = True
+                        # Giu nguyen bo phan loai/hold hien tai. Beep ngay khi
+                        # trang thai che duoc xac nhan, sau do lap lai moi 4 giay.
+                        if not self.camera_obstructed:
+                            self.camera_obstructed = True
+                            log.warning("CAMERA_OBSTRUCTED_ENTER: camera frame classified as covered")
+                            beep_async(850, 260)
+                            last_camera_beep = time.time()
+                        elif time.time() - last_camera_beep >= 4.0:
+                            beep_async(850, 260)
+                            last_camera_beep = time.time()
                 else:
+                    if self.camera_obstructed:
+                        log.info("CAMERA_OBSTRUCTED_CLEARED: camera frame visible again; alarm re-armed")
+                        # Am xac nhan phuc hoi khac tan so/cao do voi canh bao che.
+                        beep_async(620, 140)
                     self._obstructed_since = None
                     self.camera_obstructed = False
+                    last_camera_beep = 0.0
 
                 if self.camera_obstructed:
                     # Không báo buồn ngủ; reset timer detection
@@ -1802,7 +2251,15 @@ class DrowsinessApp:
                         log_alert(alert_start_ts, time.time(), alert_reasons_snap)
                         alert_active = False
                     is_alarm_on = False
-                    self.status = "CAMERA OBSTRUCTED"
+                    normal_stable_start = None
+                    eye_occlusion_recovery = False
+                    degraded_since = None
+                    occlusion_streak = 0
+                    occlusion_reason = ""
+                    eye_occlusion_tracker.reset()
+                    eye_occ_degraded_streak = 0
+                    eye_occ_degraded_since = None
+                    self.status = "CAMERA_ERROR"
                     self.reason = ""
                     self.env_flag = "obstructed"
                     self.ear = self.mar = self.pitch = self.yaw = 0.0
@@ -1811,7 +2268,7 @@ class DrowsinessApp:
                     self.eye_progress = self.yawn_progress = 0.0
                     self.eye_unreliable = False
                     cv2.putText(
-                        frame, "CAMERA OBSTRUCTED", (40, 80),
+                        frame, "CAMERA_ERROR", (40, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3,
                     )
                     rgb_show = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -1866,34 +2323,75 @@ class DrowsinessApp:
                 is_deep_alarm = False
                 current_th = EAR_THRESHOLD_NORMAL
                 eye_unreliable = False
+                eye_occluded = False
+                ear_measurement_valid = False
+                left_landmarks_valid = False
+                right_landmarks_valid = False
+                landmark_valid = False
+                ear_valid = False
+                eye_visible = False
+                mouth_observable = False
 
                 if result.face_landmarks:
                     face_lost_start = None
                     fl = result.face_landmarks[0]
 
-                    left_ear = eye_aspect_ratio(fl, LEFT_EYE, w, h)
-                    right_ear = eye_aspect_ratio(fl, RIGHT_EYE, w, h)
+                    # Tách ba khái niệm: landmark hợp lệ, ROI có thể quan sát,
+                    # và EAR có thể tính. Mí khép vẫn có landmark hợp lệ.
+                    left_landmarks_valid = eye_landmarks_valid(fl, LEFT_EYE, w, h)
+                    right_landmarks_valid = eye_landmarks_valid(fl, RIGHT_EYE, w, h)
+                    left_ear = (eye_aspect_ratio(fl, LEFT_EYE, w, h)
+                                if left_landmarks_valid else 0.0)
+                    right_ear = (eye_aspect_ratio(fl, RIGHT_EYE, w, h)
+                                 if right_landmarks_valid else 0.0)
                     mar_value = mouth_aspect_ratio(fl, MOUTH, w, h)
                     pitch = compute_head_pitch_score(fl, w, h)
                     yaw = compute_head_yaw_score(fl, w, h)
 
-                    ratio_th = (
-                        SUNGLASS_RATIO_LOWLIGHT
-                        if light_flag == "low_light"
-                        else SUNGLASS_RATIO_NORMAL
-                    )
-                    if is_sunglasses_relative(frame, fl, w, h, ratio_th):
-                        sunglass_streak += 1
-                    else:
-                        sunglass_streak = 0
-                    eye_unreliable = sunglass_streak >= SUNGLASS_CONFIRM_FRAMES
-                    if eye_unreliable:
-                        env_parts.append("sunglass")
+                    # Khong dung ti le do xam mat/da de nhan kinh ram: bong long
+                    # may, bong do va thay doi phoi sang co the tao cung ket qua.
+                    # Tracker ben duoi doi chieu cau truc ROI mo rong theo tung mat.
 
-                    if eyes_overexposed(frame, fl, w, h):
+                    # Chói sáng là thuộc tính ánh sáng, không phải bằng chứng mắt bị che.
+                    # Giữ nhãn môi trường để hiển thị/ghi nhận nhưng không vô hiệu hóa EAR
+                    # hoặc đẩy trạng thái sang DEGRADED chỉ vì ngưỡng sáng tuyệt đối.
+                    if eyes_overexposed(frame, fl, w, h) and "glare" not in env_parts:
+                        env_parts.append("glare")
+
+                    # Che mắt độc lập với nhận diện mặt/góc quay/ánh sáng.
+                    # Ở yaw cực đại, tracker chỉ xét mắt mà thuật toán EAR gốc sử dụng.
+                    # Luôn chạy tracker che mắt, kể cả khi ánh sáng thay đổi
+                    # hoặc kính râm đã được xác nhận. Hai tín hiệu độc lập:
+                    # Tracker đánh giá độc lập từng mắt; mắt còn lại vẫn có thể
+                    # duy trì theo dõi nếu ROI của nó đủ rõ và EAR hợp lệ.
+                    eye_occluded = eye_occlusion_tracker.update(
+                        frame, fl, w, h, yaw, pitch, left_ear, right_ear
+                    )
+                    landmark_valid = (
+                        left_landmarks_valid if yaw > YAW_EXTREME else
+                        right_landmarks_valid if yaw < -YAW_EXTREME else
+                        left_landmarks_valid and right_landmarks_valid
+                    )
+                    eye_visible = eye_occlusion_tracker.any_eye_clear
+                    if eye_occluded:
                         eye_unreliable = True
-                        if "glare" not in env_parts:
-                            env_parts.append("glare")
+                        env_parts.append("eye_occlusion")
+                        # Tracker ghi CONFIRMED_OCCLUSION khi vua xac nhan;
+                        # DEGRADED_ENTER ghi ly do/ROI chi tiet, tranh log moi frame.
+
+                    # Chỉ giữ kiểm tra miệng để ngăn MAR báo ngáp khi miệng bị che.
+                    mouth_occluded = assess_mouth_coverage(frame, fl, w, h)
+                    if mouth_occluded:
+                        occlusion_streak = min(occlusion_streak + 1, OCCLUSION_CONFIRM_FRAMES + 2)
+                        occlusion_reason = "occluded_mouth"
+                        env_parts.append("occlusion:occluded_mouth")
+                    else:
+                        occlusion_streak = max(0, occlusion_streak - 1)
+                        if occlusion_streak == 0:
+                            occlusion_reason = ""
+                    # Độ tin cậy miệng độc lập với mắt; chỉ MAR cần landmark
+                    # khuôn mặt và vùng miệng chưa bị xác nhận che khuất.
+                    mouth_observable = (occlusion_streak < OCCLUSION_CONFIRM_FRAMES)
 
                     mw = euclidean_distance(
                         (fl[61].x * w, fl[61].y * h),
@@ -1905,14 +2403,41 @@ class DrowsinessApp:
                     )
                     is_smiling = (mw / (fw + 1e-6)) > SMILE_RATIO_THRESHOLD
 
+                    unavailable_eyes = set(eye_occlusion_tracker.last_occluded_eyes)
+                    if not left_landmarks_valid or not right_landmarks_valid:
+                        log.debug(
+                            "EAR_LANDMARK_VALIDITY left=%s right=%s yaw=%.3f; "
+                            "invalid geometry is not classified as occlusion",
+                            left_landmarks_valid, right_landmarks_valid, yaw)
                     if yaw > YAW_EXTREME:
-                        ear_value = left_ear
+                        ear_measurement_valid = left_landmarks_valid
+                        ear_value = left_ear if ear_measurement_valid else 0.0
                         current_th = EAR_THRESHOLD_EXTREME
                     elif yaw < -YAW_EXTREME:
-                        ear_value = right_ear
+                        ear_measurement_valid = right_landmarks_valid
+                        ear_value = right_ear if ear_measurement_valid else 0.0
                         current_th = EAR_THRESHOLD_EXTREME
+                    elif unavailable_eyes == {"left"}:
+                        ear_measurement_valid = right_landmarks_valid
+                        ear_value = right_ear if ear_measurement_valid else 0.0
+                        current_th = (EAR_THRESHOLD_YAW if abs(yaw) > YAW_HIGH
+                                      else EAR_THRESHOLD_NORMAL)
+                    elif unavailable_eyes == {"right"}:
+                        ear_measurement_valid = left_landmarks_valid
+                        ear_value = left_ear if ear_measurement_valid else 0.0
+                        current_th = (EAR_THRESHOLD_YAW if abs(yaw) > YAW_HIGH
+                                      else EAR_THRESHOLD_NORMAL)
                     else:
-                        ear_value = (left_ear + right_ear) / 2.0
+                        # Khi một bên có landmark lỗi, vẫn có thể đo EAR từ bên
+                        # còn hợp lệ; không gán bên lỗi thành EAR=0 (nhắm mắt giả).
+                        valid_ears = []
+                        if left_landmarks_valid:
+                            valid_ears.append(left_ear)
+                        if right_landmarks_valid:
+                            valid_ears.append(right_ear)
+                        ear_measurement_valid = bool(valid_ears)
+                        ear_value = (sum(valid_ears) / len(valid_ears)
+                                     if valid_ears else 0.0)
                         if abs(yaw) > YAW_HIGH:
                             current_th = EAR_THRESHOLD_YAW
                         elif pitch > PITCH_HIGH or is_smiling:
@@ -1927,12 +2452,18 @@ class DrowsinessApp:
                         if current_th < EAR_THRESHOLD_LOWLIGHT:
                             current_th = EAR_THRESHOLD_LOWLIGHT
 
-                    # EAR mọi frame (kể cả blur)
-                    if eye_unreliable:
-                        if eye_closed_start is not None:
-                            closed_duration = time.time() - eye_closed_start
-                        else:
-                            closed_duration = 0.0
+                    ear_valid = ear_measurement_valid
+                    # Chỉ cần landmark của mắt thực sự được dùng để đo EAR hợp lệ;
+                    # không bắt buộc mắt xa phải có landmark tốt khi quay/nghiêng đầu.
+                    landmark_valid = ear_measurement_valid
+                    # EAR chi chay khi co landmark hinh hoc hop le va khong co
+                    # mat nao da duoc tracker xac nhan che. Mat nham van hop le.
+                    if eye_unreliable or not ear_valid:
+                        # Khong dung EAR=0 tu landmark loi de tao nham mat gia.
+                        eye_closed_start = None
+                        closed_duration = 0.0
+                        open_streak = 0
+                        ear_smooth_ready = False
                     else:
                         if not ear_smooth_ready:
                             ear_smooth = ear_value
@@ -2028,7 +2559,9 @@ class DrowsinessApp:
                             frame, (int(lm.x * w), int(lm.y * h)), 1, (0, 220, 100), -1
                         )
                 else:
-                    sunglass_streak = 0
+                    occlusion_streak = 0
+                    occlusion_reason = ""
+                    eye_occlusion_tracker.reset()
                     if face_lost_start is None:
                         face_lost_start = time.time()
                     lost = time.time() - face_lost_start
@@ -2068,15 +2601,71 @@ class DrowsinessApp:
                             open_streak = 0
                             ear_smooth_ready = False
 
+                # Độ tin cậy mắt và miệng độc lập: mắt bị che chỉ vô hiệu EAR,
+                # không vô hiệu MAR/ngáp, gật gù hoặc cúi sâu.
                 eye_alarm = (not eye_unreliable) and (
                     closed_duration >= EYE_CLOSED_TIME_LIMIT
                 )
-                yawn_alarm = yawn_duration >= YAWN_TIME_LIMIT
+                # Không dùng MAR khi miệng đang bị che (khẩu trang / tay)
+                yawn_alarm = (yawn_duration >= YAWN_TIME_LIMIT) and mouth_observable
                 should_alarm = (
                     eye_alarm or yawn_alarm or is_nodding_alarm or is_deep_alarm
                 )
 
-                if should_alarm:
+                has_face = bool(result.face_landmarks)
+                # Mất mặt/landmark lỗi chỉ ảnh hưởng phép đo và cảnh báo;
+                # không phải bằng chứng vật thể che đồng thời cả hai mắt.
+                face_missing_age = (
+                    time.time() - face_lost_start
+                    if (not has_face and face_lost_start is not None) else 0.0
+                )
+                face_missing = (not has_face) and (face_missing_age >= FACE_LOST_GRACE)
+                # Temporal Validation lớp 2: tracker chỉ đưa ra kết quả che mắt
+                # sau khi có bằng chứng cấu trúc liên tục; cổng trạng thái còn yêu
+                # cầu kết quả ấy tồn tại thêm đủ số frame và thời gian tối thiểu.
+                # Nhờ vậy một lần dao động tracker/ánh sáng không làm đổi trạng thái.
+                now_validation = time.monotonic()
+                if eye_occluded:
+                    eye_occ_degraded_streak += 1
+                    if eye_occ_degraded_since is None:
+                        eye_occ_degraded_since = now_validation
+                else:
+                    eye_occ_degraded_streak = 0
+                    eye_occ_degraded_since = None
+                eye_occ_confirmed = (
+                    eye_occluded
+                    and eye_occ_degraded_streak >= OCCLUSION_DEGRADED_CONFIRM_FRAMES
+                    and eye_occ_degraded_since is not None
+                    and now_validation - eye_occ_degraded_since >= OCCLUSION_DEGRADED_CONFIRM_SEC
+                )
+
+                # Mất toàn bộ khuôn mặt kéo dài hoặc cả hai mắt bị tracker
+                # xác nhận che đều làm dữ liệu giám sát không còn đáng tin cậy.
+                # Nhắm mắt, landmark dao động và thay đổi tư thế không tự kích hoạt.
+                data_unreliable = face_missing or eye_occ_confirmed
+                if data_unreliable and self.status != "DEGRADED":
+                    cause = ("face_missing" if face_missing
+                             else "both_eyes_occluded_confirmed")
+                    log.info(
+                        "DEGRADED_ENTER cause=%s face_missing=%s eye_occluded=%s "
+                        "face_missing_age=%.2fs selected_eyes=%s confirmed_occluded_eyes=%s "
+                        "roi_unavailable_eyes=%s both_eyes_clear=%s "
+                        "ear_measurement_valid=%s left_landmarks_valid=%s "
+                        "right_landmarks_valid=%s eye_tracker=%s",
+                        cause, face_missing, eye_occ_confirmed, face_missing_age,
+                        ",".join(eye_occlusion_tracker.last_selected_eyes),
+                        ",".join(eye_occlusion_tracker.last_occluded_eyes),
+                        ",".join(eye_occlusion_tracker.last_unavailable_eyes),
+                        eye_occlusion_tracker.both_eyes_clear,
+                        ear_measurement_valid, left_landmarks_valid,
+                        right_landmarks_valid,
+                        " | ".join(eye_occlusion_tracker.last_diagnostics),
+                    )
+
+                # Khi còn landmark khuôn mặt, cảnh báo từ vùng đáng tin cậy vẫn
+                # được phép chạy trong DEGRADED (ví dụ MAR rõ nhưng cả hai mắt bị che).
+                # Mất toàn bộ khuôn mặt thì không còn MAR đáng tin để cảnh báo.
+                if should_alarm and not face_missing and not data_unreliable:
                     reasons = []
                     if eye_alarm:
                         reasons.append("Mắt nhắm")
@@ -2103,14 +2692,98 @@ class DrowsinessApp:
                             beep_async(1000, 120)
                             last_beep_time = time.time()
                     self.reason = " + ".join(reasons)
-                    self.status = "WARNING"
+                    self.status = "DROWSY"
+                    normal_stable_start = None
+                    degraded_since = None
+                elif data_unreliable:
+                    # DEGRADED khi mất khuôn mặt quá FACE_LOST_GRACE hoặc
+                    # cả hai mắt được tracker xác nhận che qua nhiều frame.
+                    # Các cảnh báo từ vùng còn quan sát được (đặc biệt MAR/ngáp)
+                    # vẫn được ghi nhận và phát âm thanh mà không đổi trạng thái.
+                    if should_alarm and not face_missing:
+                        reasons = []
+                        if eye_alarm:
+                            reasons.append("Mắt nhắm")
+                        if yawn_alarm:
+                            reasons.append("Ngáp")
+                        if is_nodding_alarm:
+                            reasons.append("Gật gù")
+                        if is_deep_alarm:
+                            reasons.append("Cúi sâu")
+                        if not is_alarm_on:
+                            is_alarm_on = True
+                            alert_active = True
+                            alert_start_ts = time.time()
+                            alert_reasons_snap = list(reasons)
+                            self.session_alerts += 1
+                            for _r in reasons:
+                                self.advisor.record_event(_r)
+                            beep_async(1000, 160)
+                            last_beep_time = time.time()
+                        else:
+                            alert_reasons_snap = list(reasons)
+                            if time.time() - last_beep_time >= BEEP_INTERVAL:
+                                beep_async(1000, 120)
+                                last_beep_time = time.time()
+                    elif alert_active:
+                        log_alert(alert_start_ts, time.time(), alert_reasons_snap)
+                        alert_active = False
+                        is_alarm_on = False
+                    else:
+                        is_alarm_on = False
+                    self.reason = ("Không phát hiện khuôn mặt" if face_missing
+                                   else "Cả hai mắt bị che")
+                    self.status = "DEGRADED"
+                    # Mọi lần vào DEGRADED đều phải qua 1.5s dữ liệu ổn định
+                    # trước khi về NORMAL, không chỉ riêng episode che mắt.
+                    eye_occlusion_recovery = True
+                    normal_stable_start = None
+                    now_t = time.time()
+                    if degraded_since is None:
+                        degraded_since = now_t
+                    # Âm thanh nhắc riêng cho DEGRADED (khác DROWSY), sau 1.5s, cooldown 2.5s
+                    if (now_t - degraded_since >= DEGRADED_BEEP_AFTER
+                            and now_t - last_degraded_beep >= DEGRADED_BEEP_COOLDOWN):
+                        beep_async(700, 90)
+                        last_degraded_beep = now_t
                 else:
+                    # Ứng viên NORMAL: có mặt + dữ liệu ổn; chỉ chuyển khi ổn định liên tục >= 1.5s
                     if alert_active:
                         log_alert(alert_start_ts, time.time(), alert_reasons_snap)
                         alert_active = False
                     is_alarm_on = False
                     self.reason = ""
-                    self.status = "NORMAL"
+                    degraded_since = None
+                    now_t = time.time()
+                    if eye_occlusion_recovery:
+                        # Dung du lieu cua frame hien tai, khong dung co occlusion
+                        # cu: mat phai co ROI ro, landmark/EAR hop le va tracker
+                        # xac nhan tat ca mat dang duoc chon da hien thi tro lai.
+                        recovery_data_valid = (
+                            has_face and landmark_valid and ear_valid
+                            and not eye_occluded and eye_visible
+                        )
+                        if recovery_data_valid:
+                            if normal_stable_start is None:
+                                normal_stable_start = now_t
+                            if (now_t - normal_stable_start) >= NORMAL_STABLE_SEC:
+                                self.status = "NORMAL"
+                                eye_occlusion_recovery = False
+                                normal_stable_start = None
+                                eye_occ_degraded_streak = 0
+                                eye_occ_degraded_since = None
+                            else:
+                                # Keep DEGRADED while the 1.5s clear-data dwell runs.
+                                self.status = "DEGRADED"
+                                self.reason = "Đang xác nhận vùng mắt đã ổn định"
+                        else:
+                            normal_stable_start = None
+                            self.status = "DEGRADED"
+                            self.reason = "Chờ dữ liệu mắt ổn định"
+                        # Chỉ episode thiếu dữ liệu do che mắt mới cần ổn định 1.5 giây.
+                    else:
+                        self.status = "NORMAL"
+                        normal_stable_start = None
 
                 self.ear, self.mar = ear_value, mar_value
                 self.pitch, self.yaw = pitch, yaw
@@ -2121,7 +2794,10 @@ class DrowsinessApp:
                     100.0, closed_duration / EYE_CLOSED_TIME_LIMIT * 100
                 )
                 self.yawn_progress = min(100.0, yawn_duration / YAWN_TIME_LIMIT * 100)
-                self.eye_unreliable = eye_unreliable
+                # UI flag includes invalid EAR geometry, but does not relabel it
+                # as confirmed physical occlusion in the detection state machine.
+                self.eye_unreliable = (eye_unreliable or
+                                       (has_face and not ear_measurement_valid))
                 self.current_th_display = current_th
                 self.env_flag = ", ".join(env_parts)
 
@@ -2129,14 +2805,11 @@ class DrowsinessApp:
                 self.fps = int(1.0 / (now - prev_time + 1e-6))
                 prev_time = now
 
-                if eye_unreliable and "sunglass" in self.env_flag:
+                if eye_unreliable:
+                    skip_reason = ("confirmed eye occlusion" if eye_occluded
+                                   else "invalid eye geometry")
                     cv2.putText(
-                        frame, "EAR skipped (sunglass)", (12, h - 12),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1,
-                    )
-                elif eye_unreliable:
-                    cv2.putText(
-                        frame, "EAR skipped (glare/eyes)", (12, h - 12),
+                        frame, f"EAR skipped ({skip_reason})", (12, h - 12),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1,
                     )
                 elif light_flag == "low_light":
@@ -2245,8 +2918,8 @@ class DrowsinessApp:
             return
 
         if self.camera_obstructed and self.running:
-            self._pill("CAMERA BỊ CHE", "warn")
-            self._set_banner("Camera bị che hoặc không có hình — hãy kiểm tra ống kính.", "warn")
+            self._pill("CAMERA_ERROR", "warn")
+            self._set_banner("Camera bị che hoặc không đọc được frame — hãy kiểm tra ống kính.", "warn")
             for t in self.tiles.values():
                 t.set("—")
             self.tile_fps.set(f"{self.fps} FPS")
@@ -2255,23 +2928,32 @@ class DrowsinessApp:
             self.root.after(30, self.update_gui)
             return
 
-        if self.status == "WARNING":
-            self._pill("CẢNH BÁO", "danger", self.reason or "")
-            self._set_banner("CẢNH BÁO  ·  " + (self.reason or ""), "danger")
+        if self.status == "DROWSY":
+            self._pill("DROWSY", "danger", self.reason or "")
+            reason = self.reason or "Dấu hiệu buồn ngủ"
+            self._set_banner("DROWSY  ·  " + reason, "danger")
+        elif self.status == "DEGRADED":
+            self._pill("DEGRADED", "info", self.reason or "")
+            # Banner ngắn, cố định để không giật khi reason đổi
+            reason = self.reason or "Thiếu dữ liệu"
+            self._set_banner("DEGRADED  ·  " + reason, "info")
+        elif self.status == "CAMERA_ERROR":
+            self._pill("CAMERA_ERROR", "warn")
+            self._set_banner("CAMERA_ERROR  ·  Kiểm tra ống kính / camera", "warn")
         else:
             self._pill("BÌNH THƯỜNG", "ok")
             if time.time() < self._thanks_until:
                 self._set_banner("Cảm ơn bạn, hãy chú ý an toàn khi lái xe.", "ok")
             elif self.env_flag:
-                self._set_banner("Đang hoạt động  ·  điều kiện: " + self.env_flag, "idle")
+                self._set_banner("Đang hoạt động  ·  " + self.env_flag, "idle")
             else:
-                self._set_banner("Hệ thống hoạt động bình thường — chưa phát hiện dấu hiệu bất thường.",
-                                 "idle")
+                self._set_banner("Hệ thống hoạt động bình thường.", "idle")
 
+        # Độ dài cố định — tránh giật layout khi bật/tắt "skip"
         if self.eye_unreliable:
-            self.tiles["ear"].set(f"{self.ear:.3f} ·bỏ qua")
+            self.tiles["ear"].set(f"{self.ear:.3f} skip")
         else:
-            self.tiles["ear"].set(f"{self.ear:.3f}")
+            self.tiles["ear"].set(f"{self.ear:.3f}     ")
         self.tiles["mar"].set(f"{self.mar:.3f}")
         self.tiles["pitch"].set(f"{self.pitch:.2f}")
         self.tiles["yaw"].set(f"{self.yaw:.2f}")
