@@ -2,3 +2,9 @@ google-genai
 chromadb
 pypdf
 python-docx
+customtkinter 
+mediapipe 
+winsdk
+tkintermapview
+pyserial
+ultralytics

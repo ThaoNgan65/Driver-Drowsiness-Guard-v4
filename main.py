@@ -35,6 +35,8 @@ import ui_theme as T
 from route_map import RoutePlanner
 from fatigue_advisor import AdvisorService, AdvicePopup
 from vision_health import HealthVision
+from camera_manager import CameraManager, CameraUnrecoverable
+from worker_lifecycle import Supervisor, SupervisorConfig
 # RAG la chuc nang doc lap; khong goi trong detection_loop
 RAG_IMPORT_ERROR = ""
 try:
@@ -56,6 +58,9 @@ EAR_THRESHOLD_YAW = 0.25
 EAR_THRESHOLD_EXTREME = 0.28
 EAR_VERY_LOW = 0.12
 EAR_THRESHOLD_LOWLIGHT = 0.23
+EAR_CLOSING_RATIO = 0.75      # híp: EAR < 75% mức mở của chính tài xế (khi nhìn thẳng)
+EAR_OPEN_ALPHA = 0.01         # tốc độ cập nhật mức mở (chậm)
+EAR_OPEN_TRACK = 0.9          # chỉ cập nhật mức mở khi mắt đang mở rõ (>= 90% mức hiện tại)
 
 EYE_CLOSED_TIME_LIMIT = 1.8
 MAR_THRESHOLD = 0.65
@@ -104,11 +109,24 @@ OCCLUSION_SKIN_MIN = 35.0
 EYE_OCC_CONFIRM_FRAMES = 3
 EYE_EAR_OPEN = 0.14
 
-CAM_FAIL_REOPEN = 30
+CAM_FAIL_REOPEN = 30             # so lan read loi lien tiep moi coi la mat camera
+CAM_OPEN_RETRIES = 3             # so lan thu mo camera moi dot (acquire/reconnect)
+CAM_OPEN_BACKOFF = (0.5, 1.0, 2.0)   # cho giua cac lan thu (s)
+CAM_READ_FAIL_SLEEP = 0.02
+# Camera dang bi app khac chiem: van doc duoc frame nhung toan den (ret=True).
+CAM_DEAD_MAX_PIXEL = 8           # frame "chet": gan nhu den tuyet doi (tay che khong den den muc nay)
+CAM_DEAD_REOPEN_AFTER = 3.0      # giay frame chet lien tuc moi thu mo lai camera
+CAM_DEAD_REOPEN_COOLDOWN = 4.0   # khoang cach toi thieu giua hai lan mo lai
+CAM_OBSTRUCTED_REOPEN_AFTER = 5.0  # da CAMERA_OBSTRUCTED bay nhieu giay -> thu mo lai camera (tay che cung vo hai)
 
-# ----- An toàn / watchdog -----
-HEARTBEAT_TIMEOUT = 2.5          # giây không có frame/detect → SYSTEM ERROR
-WATCHDOG_CHECK_MS = 500
+# ----- An toan / watchdog / vong doi worker -----
+HEARTBEAT_TIMEOUT = 2.5          # giay khong co frame/detect -> restart
+HEARTBEAT_OPEN_GRACE = 10.0      # han rong hon khi dang mo/mo lai camera
+SUPERVISOR_TICK_MS = 100         # chu ky state machine (khong chan UI)
+STOP_JOIN_TIMEOUT = 3.0          # qua han nay ma worker chua thoat => zombie => loi an toan
+RESTART_SETTLE_S = 0.3           # nghi truoc khi tao worker moi
+STABLE_RUN_RESET_S = 120.0       # chay on dinh bay nhieu giay thi dat lai bo dem restart
+EXIT_JOIN_TIMEOUT = 2.0          # on_exit cho worker dung toi da bay nhieu giay
 MAX_DETECT_RESTARTS = 2
 OBSTRUCTED_HOLD_SEC = 2.0
 # 1) Flatness trên ảnh blur (bắt che mọi màu)
@@ -130,18 +148,21 @@ MOUTH = [61, 291, 13, 14]
 SKIN_REF = [10, 50, 280]
 
 # ----- Error logging -----
+# System log chỉ ghi sự kiện quan trọng (INFO trở lên). Chi tiết chẩn đoán từng frame
+# ở mức DEBUG, chỉ bật khi cần kiểm tra lỗi: đặt biến môi trường DROWSY_DEBUG=1.
+LOG_DEBUG = os.environ.get("DROWSY_DEBUG") == "1"
 def setup_error_logger():
     logger = logging.getLogger("drowsiness")
     if logger.handlers:
         return logger
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG if LOG_DEBUG else logging.INFO)
     fmt = logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     fh = logging.FileHandler(ERROR_LOG_PATH, encoding="utf-8")
     fh.setFormatter(fmt)
-    fh.setLevel(logging.INFO)
+    fh.setLevel(logging.DEBUG if LOG_DEBUG else logging.INFO)
     sh = logging.StreamHandler()
     sh.setFormatter(fmt)
     sh.setLevel(logging.WARNING)
@@ -305,29 +326,26 @@ def _roi_laplacian_var(bgr, landmarks, indices, w, h, pad=4):
 
 
 class PoseAwareEyeOcclusionTracker:
-    """Phat hien che mat bang bang chung cau truc da vung, chong bien doi anh sang.
+    """Phân loại từng mắt: mở (thấy lòng đen), nhắm (thấy đường mi) hoặc không quan sát được.
 
-    Do sang/contrast/Laplacian khong bao gio la bang chung doc lap. Tracker
-    doi chieu cau truc theo tung o, do ben vung cua texture va yeu cau nhieu
-    frame lien tiep truoc khi xac nhan.
+    Đo trên ROI đã chuẩn hóa theo landmark (xoay theo trục mắt, co theo bề rộng mắt)
+    và chia cho độ sáng da mặt nên không phụ thuộc tư thế hay ánh sáng. Không dùng
+    ảnh tham chiếu nên vật che không thể trở thành "mắt bình thường". Che mắt chỉ được
+    chốt/xóa sau nhiều frame liên tiếp (đếm có trễ, xóa chỉ khi thấy mắt liên tục).
     """
-    def __init__(self, confirm_frames=5, similarity_min=0.68):
+    IRIS_FLOOR = 0.06  # tương phản lòng đen tối thiểu để học mốc (kính, tay <= 0.05)
+    IRIS_REL = 0.5     # mắt mở khi lòng đen còn >= 50% mốc của chính người dùng
+    LID_MIN = 0.06    # đường mi khi mắt nhắm (~0.10-0.20; kính <= 0.035, tay ~0.01)
+
+    def __init__(self, confirm_frames=5):
         self.confirm_frames = max(5, int(confirm_frames))
-        self.similarity_min = float(similarity_min)
         self.states = {tuple(LEFT_EYE): self._new_state(),
                        tuple(RIGHT_EYE): self._new_state()}
-        self.last_diagnostics = []
-        self.last_selected_eyes = []
-        self.last_occluded_eyes = []
-        self.last_unavailable_eyes = []
-        self.both_eyes_clear = False
-        self.any_eye_clear = False
+        self.reset()
 
     @staticmethod
     def _new_state():
-        return {"ref": None, "ref_texture": None, "yaw": None, "pitch": None,
-                "width": None, "bad": 0,
-                "occluded": False, "warmup": 0, "diag_count": 0}
+        return {"bad": 0, "ok": 0, "occluded": False, "ref": None}
 
     def reset(self):
         for key in self.states:
@@ -339,22 +357,20 @@ class PoseAwareEyeOcclusionTracker:
         self.both_eyes_clear = False
         self.any_eye_clear = False
 
-    def _patch(self, frame, landmarks, eye_indices, w, h):
+    @staticmethod
+    def _measure(frame, landmarks, eye_indices, w, h, skin):
+        """Trả về (iris, lid, None) hoặc (None, None, lý do) khi ROI không dùng được."""
         pts = np.asarray([(landmarks[i].x * w, landmarks[i].y * h)
                           for i in eye_indices], dtype=np.float32)
         if pts.shape != (6, 2) or not np.isfinite(pts).all():
-            return None, None, {"valid": False, "reason": "invalid_landmarks"}
-        width = float(np.linalg.norm(pts[3] - pts[0]))
-        if width < 7.0:
-            return None, width, {"valid": False, "reason": "roi_too_small"}
+            return None, None, "invalid_landmarks"
+        axis_len = float(np.linalg.norm(pts[3] - pts[0]))
+        if axis_len < 7.0:
+            return None, None, "roi_too_small"
         top = (pts[1] + pts[2]) * 0.5
         bottom = (pts[4] + pts[5]) * 0.5
-        # ROI that truoc day chi noi suy tu 4 diem nam tren duong vien mat,
-        # mac du duoc gan nhan "expanded". Mo rong theo truc mat de lay ca
-        # long may, mi duoi, thai duong va phan gong/trong kinh vuot khoi vien.
-        eye_axis = pts[3] - pts[0]
-        axis_len = float(np.linalg.norm(eye_axis))
-        unit_x = eye_axis / max(axis_len, 1e-6)
+        # ROI mở rộng theo trục mắt để lấy cả lông mày, mi dưới và phần gọng/kính.
+        unit_x = (pts[3] - pts[0]) / axis_len
         unit_y = np.asarray([-unit_x[1], unit_x[0]], dtype=np.float32)
         if float(np.dot(bottom - top, unit_y)) < 0:
             unit_y = -unit_y
@@ -369,297 +385,109 @@ class PoseAwareEyeOcclusionTracker:
             center + unit_y * half_height,
         ], dtype=np.float32)
         dst4 = np.asarray([[0, 32], [48, 0], [95, 32], [48, 63]], dtype=np.float32)
-        matrix = cv2.getPerspectiveTransform(src4, dst4)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        raw = cv2.warpPerspective(gray, matrix, (96, 64),
+        raw = cv2.warpPerspective(gray, cv2.getPerspectiveTransform(src4, dst4), (96, 64),
                                   flags=cv2.INTER_LINEAR,
-                                  borderMode=cv2.BORDER_REPLICATE)
-        raw_std = float(np.std(raw))
-        clipped_ratio = float(np.mean((raw <= 5) | (raw >= 250)))
-        # Ban do pixel toi theo Otsu tren toan ROI (4x4 o), chi de debug.
-        # Ban do nay khong tu minh quyet dinh kinh ram/che mat.
-        _, dark_mask = cv2.threshold(
-            raw, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU
-        )
-        dark_distribution = tuple(
-            int(round(float(np.mean(dark_mask[gy * 16:(gy + 1) * 16,
-                                              gx * 24:(gx + 1) * 24])) / 255.0 * 100))
-            for gy in range(4) for gx in range(4)
-        )
-
-        # Chuan hoa illumination nen cham de loai bo bong do/exposure gradient.
-        x = raw.astype(np.float32) + 1.0
-        illumination = cv2.GaussianBlur(x, (0, 0), sigmaX=8.0, sigmaY=5.0)
-        corrected = x / np.maximum(illumination, 2.0)
-        lo, hi = np.percentile(corrected, (1, 99))
-        if hi - lo > 1e-5:
-            corrected = (corrected - lo) * (255.0 / (hi - lo))
-        else:
-            corrected = np.zeros_like(corrected)
-        patch = np.clip(corrected, 0, 255).astype(np.uint8)
-        patch = cv2.createCLAHE(clipLimit=1.35, tileGridSize=(4, 4)).apply(patch)
-        # Chi danh dau mat thong tin khi patch gan nhu khong con bien thien
-        # hoac bi clipping gan toan bo. Muc clipping vua phai/contrast thap
-        # van co the duoc CLAHE + chuan hoa nen phuc hoi de so sanh cau truc.
-        quality = {"valid": True, "raw_std": raw_std,
-                   "clipped_ratio": clipped_ratio,
-                   "photometric_limited": clipped_ratio >= 0.85 or raw_std < 2.0,
-                   "dark_distribution": dark_distribution,
-                   "roi": "expanded_eye_periocular"}
-        return patch, width, quality
-
-    @staticmethod
-    def _normalize_structure(patch):
-        x = patch.astype(np.float32)
-        x = x - cv2.GaussianBlur(x, (0, 0), 2.2)
-        scale = float(np.percentile(np.abs(x), 90)) + 1e-4
-        return np.clip(x / scale, -3.0, 3.0)
-
-    @classmethod
-    def _similarity_details(cls, a, b):
-        if a is None or b is None or a.shape != b.shape:
-            return {"score": -1.0, "ncc": -1.0, "orientation": 0.0,
-                    "edge_iou": 0.0, "bad_cells": 16}
-        an, bn = cls._normalize_structure(a), cls._normalize_structure(b)
-        pad_a = cv2.copyMakeBorder(an, 2, 2, 3, 3, cv2.BORDER_REFLECT_101)
-        ncc = float(np.clip(cv2.matchTemplate(
-            pad_a, bn, cv2.TM_CCOEFF_NORMED).max(), -1.0, 1.0))
-        ax = cv2.Sobel(an, cv2.CV_32F, 1, 0, ksize=3)
-        ay = cv2.Sobel(an, cv2.CV_32F, 0, 1, ksize=3)
-        bx = cv2.Sobel(bn, cv2.CV_32F, 1, 0, ksize=3)
-        by = cv2.Sobel(bn, cv2.CV_32F, 0, 1, ksize=3)
-        amag, bmag = cv2.magnitude(ax, ay), cv2.magnitude(bx, by)
-        threshold = max(float(np.percentile(amag, 45)),
-                        float(np.percentile(bmag, 45)), 1e-3)
-        valid = (amag > threshold * 0.35) & (bmag > threshold * 0.35)
-        if int(valid.sum()) >= 16:
-            dot = ax[valid] * bx[valid] + ay[valid] * by[valid]
-            denom = amag[valid] * bmag[valid] + 1e-5
-            orientation = float((np.mean(np.clip(dot / denom, -1, 1)) + 1) * 0.5)
-        else:
-            orientation = 0.5
-        active_a, active_b = amag > threshold * 0.35, bmag > threshold * 0.35
-        union = int(np.logical_or(active_a, active_b).sum())
-        edge_iou = (float(np.logical_and(active_a, active_b).sum()) / union
-                    if union else 1.0)
-        score = (0.55 * (0.55 * ((ncc + 1.0) * 0.5) + 0.45 * orientation)
-                 + 0.45 * edge_iou)
-
-        # Chi tinh o co texture trong anh tham chieu va nam quanh mat;
-        # vung da/long may it texture khong duoc tinh la bang chung bi che.
-        bad_cells = 0
-        cell_h, cell_w = an.shape[0] // 4, an.shape[1] // 4
-        for gy in (1, 2):
-            for gx in range(4):
-                ya, yb = gy * cell_h, (gy + 1) * cell_h
-                xa, xb = gx * cell_w, (gx + 1) * cell_w
-                aa, bb = an[ya:yb, xa:xb].ravel(), bn[ya:yb, xa:xb].ravel()
-                ref_std, cur_std = float(np.std(aa)), float(np.std(bb))
-                if ref_std < 0.08:
-                    continue
-                if cur_std < 0.08:
-                    bad_cells += 1
-                else:
-                    corr = float(np.corrcoef(aa, bb)[0, 1])
-                    if not np.isfinite(corr) or corr < 0.30:
-                        bad_cells += 1
-        return {"score": float(score), "ncc": ncc,
-                "orientation": float(orientation), "edge_iou": edge_iou,
-                "bad_cells": bad_cells}
-
-    @staticmethod
-    def _texture_energy(patch):
-        x = patch.astype(np.float32)
-        return float(np.std(x - cv2.GaussianBlur(x, (0, 0), 2.0)))
-
-    def _log_diagnostic(self, message):
-        try:
-            logging.getLogger("drowsiness").info("EYE_OCCLUSION %s", message)
-        except Exception:
-            pass
+                                  borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+        # Lòng đen: khối tối rộng ~1/2 bề rộng mắt, hai bên sáng hơn (tròng trắng).
+        # Gọng mỏng hoặc đốm phản chiếu bị trung bình hóa; vật phẳng cho giá trị ~0.
+        col = raw[26:38].mean(0)
+        iris = max(min(col[x - 15:x - 8].mean(), col[x + 8:x + 15].mean())
+                   - col[x - 7:x + 8].mean() for x in range(30, 67)) / skin
+        # Đường mi: dải tối mảnh nằm ngang giữa hai vùng sáng hơn phía trên/dưới. Lấy
+        # trung vị theo cột nên đốm phản chiếu cục bộ trên kính không tạo ra "đường mi".
+        lid = float(np.median((raw[18:25, 30:66].mean(0) + raw[40:47, 30:66].mean(0)) * 0.5
+                              - raw[28:37, 30:66].min(0))) / skin
+        return float(iris), float(lid), None
 
     def update(self, frame, landmarks, w, h, yaw, pitch, left_ear, right_ear):
         if yaw > YAW_EXTREME:
-            selected = [(LEFT_EYE, left_ear, right_ear)]
+            selected = [(LEFT_EYE, left_ear)]
         elif yaw < -YAW_EXTREME:
-            selected = [(RIGHT_EYE, right_ear, left_ear)]
+            selected = [(RIGHT_EYE, right_ear)]
         else:
-            selected = [(LEFT_EYE, left_ear, right_ear),
-                        (RIGHT_EYE, right_ear, left_ear)]
+            selected = [(LEFT_EYE, left_ear), (RIGHT_EYE, right_ear)]
 
-        diagnostics = []
-        selected_names = []
-        unavailable_names = []
-        valid_patch_names = []
-        closed_names = []
-        reliable_open_names = []
-        for indices, ear, other_ear in selected:
+        # Độ sáng da mặt làm mốc chuẩn hóa; quá tối thì không đủ dữ liệu để kết luận.
+        skin = roi_gray_mean(frame, landmarks, SKIN_REF, w, h, pad=6)
+        diagnostics, selected_names = [], []
+        unavailable_names, valid_patch_names = [], []
+        reliable_names = []
+        for indices, ear in selected:
             key = tuple(indices)
             eye_name = "left" if key == tuple(LEFT_EYE) else "right"
             selected_names.append(eye_name)
             state = self.states[key]
             was_occluded = state["occluded"]
-            patch, width, quality = self._patch(frame, landmarks, indices, w, h)
-            if patch is None:
-                state["bad"] = 0
-                reason = quality.get('reason', 'unknown')
-                diagnostics.append(f"{eye_name}:roi_invalid:{reason}")
+            if skin is None or skin < OCCLUSION_SKIN_MIN:
+                iris, lid, reason = None, None, "low_light"
+            else:
+                iris, lid, reason = self._measure(frame, landmarks, indices, w, h, skin)
+            if iris is None:
+                # Không đủ dữ liệu (landmark lỗi, ROI nhỏ, thiếu sáng): giữ nguyên
+                # trạng thái, không coi là che và không coi là mắt quan sát được.
+                diagnostics.append(f"{eye_name}:hold:{reason}")
                 unavailable_names.append(eye_name)
-                self._log_diagnostic(f"{eye_name}:ROI_UNAVAILABLE reason={reason} width={width} confirmed_occluded={state['occluded']}")
                 continue
             valid_patch_names.append(eye_name)
-            eye_closed = ear < EYE_EAR_OPEN
-            if eye_closed:
-                # ROI va landmark van quan sat duoc; EAR thap la mat nham,
-                # khong phai mat bi che hay mat du lieu.
-                closed_names.append(eye_name)
 
-            pose_changed = (state["yaw"] is not None and
-                            (abs(yaw - state["yaw"]) > 0.20 or
-                             abs(pitch - state["pitch"]) > 0.20 or
-                             abs(width / max(state["width"], 1e-3) - 1.0) > 0.25))
-            if pose_changed:
-                # Xac nhan che duoc tao tu mau tham chieu cua tu the cu.
-                # Khi yaw/pitch/scale doi dang ke, ket qua cu khong con hop le
-                # cho ROI moi. Khong mang co occluded qua pose moi, vi no co the
-                # khoa EAR/DEGRADED du landmark va EAR hien tai van hop le.
-                self._log_diagnostic(
-                    f"{eye_name} reset_reference=pose_change_clear_stale_occlusion "
-                    f"previous_occluded={was_occluded} yaw={yaw:.3f} "
-                    f"pitch={pitch:.3f} width={width:.1f}")
-                self.states[key] = state = self._new_state()
-            if state["yaw"] is None:
-                state["yaw"], state["pitch"], state["width"] = yaw, pitch, width
-
-            if state["ref"] is None:
-                if ear >= EYE_EAR_OPEN:
-                    state["warmup"] += 1
-                    if state["warmup"] >= 4:
-                        state["ref"] = patch.copy()
-                        state["ref_texture"] = self._texture_energy(patch)
-                        self._log_diagnostic(
-                            f"{eye_name} reference_learned texture={state['ref_texture']:.2f} "
-                            f"raw_std={quality['raw_std']:.2f}")
-                else:
-                    diagnostics.append(f"{eye_name}:reference_waiting")
-                continue
-
-            detail = self._similarity_details(state["ref"], patch)
-            score = detail["score"]
-            ref_texture = max(float(state["ref_texture"] or 0.0), 1e-3)
-            texture_now = self._texture_energy(patch)
-            texture_ratio = texture_now / ref_texture
-
-            # Khong dung texture-energy (gan voi do tuong phan/Laplacian) lam
-            # bang chung mat du lieu: toi/sang/chinh gamma co the lam chi so nay doi.
-            # Xac nhan che can dong thoi co sai khac theo nhieu o va hinh hoc canh
-            # khong con khop; NCC thap hoac edge-IoU thap giup tach vat che khoi
-            # thay doi phoi sang/bong do. Khong sua nguong EAR hay logic pose.
-            localized_change = detail["bad_cells"] >= 3
-            edge_structure_lost = detail["edge_iou"] < 0.72
-            spatial_correlation_lost = detail["ncc"] < 0.50
-            structural_changed = (
-                not quality["photometric_limited"]
-                and localized_change
-                and score < (self.similarity_min + 0.06)
-                and (edge_structure_lost or spatial_correlation_lost)
-            )
-            photometric_only = (score < self.similarity_min and
-                                not structural_changed)
-
-            if eye_closed:
-                # Mí khép/chớp mắt không phải bằng chứng che; tạm ngưng đánh giá
-                # ROI này và không để cờ che cũ của nó gây DEGRADED trong frame này.
-                state["bad"] = 0
-            else:
-                evidence = structural_changed
-                if evidence:
-                    state["bad"] += 1
-                    if state["bad"] >= self.confirm_frames:
-                        state["occluded"] = True
-                else:
-                    state["bad"] = 0
-                    if state["occluded"] and not quality["photometric_limited"]:
-                        # Khong con bang chung che va ROI du chat luong:
-                        # hoc lai mau hien tai thay cho reference cu bi loi thoi.
-                        state["ref"] = patch.copy()
-                        state["ref_texture"] = texture_now
-                        state["occluded"] = False
-                    elif not state["occluded"] and score >= self.similarity_min + 0.10:
-                        state["ref"] = cv2.addWeighted(state["ref"], 0.992, patch, 0.008, 0)
-                        state["ref_texture"] = (0.992 * ref_texture + 0.008 * texture_now)
-
-            state["diag_count"] += 1
-            if photometric_only:
-                why = "photometric_change_not_occlusion"
-            elif structural_changed:
-                why = "structural_occlusion_candidate"
-            elif quality["photometric_limited"]:
-                why = "low_visual_quality_hold"
-            else:
-                why = "structure_consistent"
-            diag = (f"{eye_name}:{why}:roi=expanded_eye_periocular,score={score:.3f},"
-                    f"ncc={detail['ncc']:.3f},orient={detail['orientation']:.3f},"
-                    f"edge_iou={detail['edge_iou']:.3f},"
-                    f"bad_cells={detail['bad_cells']},texture_ratio={texture_ratio:.3f},"
-                    f"dark_map={quality['dark_distribution']},"
-                    f"raw_std={quality['raw_std']:.2f},clip={quality['clipped_ratio']:.2f},"
-                    f"ear={ear:.3f},other_ear={other_ear:.3f},bad={state['bad']},"
-                    f"eye_closed={eye_closed},confirmed={state['occluded']}")
-            diagnostics.append(diag)
-
-            # Log khi bat dau nghi ngo, dinh ky trong episode, va moi lan doi trang thai.
-            if (score < self.similarity_min or quality["photometric_limited"]
-                    or (evidence if not eye_closed else False)):
-                if (state["diag_count"] == 1 or state["diag_count"] % 15 == 0
-                        or state["occluded"] != was_occluded):
-                    self._log_diagnostic(diag)
-            elif state["occluded"] != was_occluded:
-                self._log_diagnostic(f"{eye_name}:RECOVERED score={score:.3f}")
-            if state["occluded"] and not was_occluded:
-                self._log_diagnostic(f"{eye_name}:CONFIRMED_OCCLUSION {diag}")
-            elif was_occluded and not state["occluded"]:
-                self._log_diagnostic(f"{eye_name}:OCCLUSION_CLEARED {diag}")
-            if state["occluded"] and not eye_closed:
+            # Quan sát được khi thấy lòng đen (mở) HOẶC thấy đường mi (híp/nhắm). Không
+            # dùng EAR để phân loại nên mắt híp (EAR trung gian) không bị coi là che; tay/kính
+            # không có đường mi nên vẫn là che dù EAR sụp hay còn mở.
+            # Mốc lòng đen học từ chính mắt đang mở của người dùng (webcam/ánh sáng
+            # khác nhau cho tương phản khác nhau). Chưa có mốc thì chưa kết luận gì.
+            ref = state["ref"]
+            if (ear >= EYE_EAR_OPEN and iris >= self.IRIS_FLOOR and not state["occluded"]
+                    and (ref is None or iris >= self.IRIS_REL * ref)):
+                ref = state["ref"] = iris if ref is None else 0.95 * ref + 0.05 * iris
+            if ref is None:
+                diagnostics.append(f"{eye_name}:calibrating,iris={iris:.3f},lid={lid:.3f},ear={ear:.3f}")
                 unavailable_names.append(eye_name)
-            elif (state["ref"] is not None and ear >= EYE_EAR_OPEN
-                  and score >= self.similarity_min + 0.08):
-                reliable_open_names.append(eye_name)
+                valid_patch_names.remove(eye_name)
+                continue
+            eye_open = iris >= self.IRIS_REL * ref
+            eye_lid = lid >= self.LID_MIN
+            # Frame lẻ tẻ "thấy mắt" (phản chiếu/gọng kính) không đủ để xóa bằng chứng:
+            # phải thấy liên tục. Cờ che chỉ tắt sau chuỗi thấy-mắt dài hơn nữa, nên kính
+            # đang đeo không chập chờn giữa che/NORMAL; tháo kính thì chuỗi này đầy rất nhanh.
+            if eye_open or eye_lid:
+                state["ok"] += 1
+                reliable_names.append(eye_name)
+                if state["ok"] >= self.confirm_frames:
+                    state["bad"] = 0
+                if state["ok"] >= 2 * self.confirm_frames:
+                    state["occluded"] = False
+            else:
+                state["ok"] = 0
+                state["bad"] = min(state["bad"] + 1, self.confirm_frames)
+                if state["bad"] >= self.confirm_frames:
+                    state["occluded"] = True
+
+            diag = (f"{eye_name}:iris={iris:.3f},ref={ref:.3f},lid={lid:.3f},ear={ear:.3f},"
+                    f"skin={skin:.0f},open={eye_open},lid_seen={eye_lid},"
+                    f"bad={state['bad']},ok={state['ok']},confirmed={state['occluded']}")
+            diagnostics.append(diag)
+            if LOG_DEBUG and state["occluded"] != was_occluded:
+                log.debug("EYE_OCCLUSION %s %s", "CONFIRMED" if state["occluded"] else "CLEARED", diag)
 
         self.last_diagnostics = diagnostics
         self.last_selected_eyes = selected_names
-        # Chi tinh trang thai cua mat dang duoc su dung o tu the hien tai;
-        # mat xa bi khuất tu nhien khi quay dau khong duoc ke thua co cu de
-        # lam mat con lai (dang quan sat duoc) bi DEGRADED.
-        active_names = set(selected_names)
-        latched_occluded = []
-        for eye_name, indices in (("left", LEFT_EYE), ("right", RIGHT_EYE)):
-            if eye_name in active_names and self.states[tuple(indices)]["occluded"]:
-                latched_occluded.append(eye_name)
-        current_occluded = (set(latched_occluded) & set(valid_patch_names)) - set(closed_names)
+        # Chỉ xét mắt đang được dùng ở tư thế hiện tại; mắt xa bị khuất tự nhiên khi
+        # quay đầu không được làm mắt còn lại (quan sát được) bị DEGRADED.
+        latched = [name for name, indices in (("left", LEFT_EYE), ("right", RIGHT_EYE))
+                   if name in selected_names and self.states[tuple(indices)]["occluded"]]
+        current_occluded = set(latched) & set(valid_patch_names)
         self.last_occluded_eyes = sorted(current_occluded)
         self.last_unavailable_eyes = sorted(set(unavailable_names))
-        # Xac nhan cac mat dang duoc su dung o pose hien tai. Khi yaw cuc dai,
-        # mat xa khong duoc chon de tinh EAR nen khong duoc phep khoa phuc hoi.
-        # Moi ROI duoc cap nhat lai trong update() o tung frame; chi mat co
-        # cau truc khop, EAR mo va khong con co occluded moi duoc xem la clear.
-        self.both_eyes_clear = (
-            bool(selected_names)
-            and set(reliable_open_names) == set(selected_names)
-            and not current_occluded
-        )
-        # Một mắt rõ và đáng tin cậy đủ duy trì theo dõi khi mắt kia khuất
-        # tự nhiên hoặc ROI mắt kia không dùng được ở góc quay hiện tại.
-        # Mat dang nham van la mat quan sat duoc neu ROI/landmark hien tai hop le;
-        # dieu nay cho phep tiep tuc tinh EAR khi mat con lai bi che.
-        self.any_eye_clear = bool(reliable_open_names or closed_names)
-        both_current_eyes_confirmed_occluded = (
-            set(selected_names) == {"left", "right"}
-            and set(valid_patch_names) == {"left", "right"}
-            and current_occluded == {"left", "right"}
-            and not closed_names
-        )
-        return both_current_eyes_confirmed_occluded
+        # Chỉ phục hồi khi mọi mắt đang chọn quan sát được trong frame này và không còn cờ che.
+        self.both_eyes_clear = (bool(selected_names)
+                                and set(reliable_names) == set(selected_names)
+                                and not current_occluded)
+        self.any_eye_clear = bool(reliable_names)
+        # DEGRADED chỉ khi mọi mắt đang chọn (cả hai) đều bị che đã xác nhận nhiều frame.
+        return (set(selected_names) == {"left", "right"}
+                and current_occluded == {"left", "right"})
+
 
 def assess_mouth_coverage(bgr, landmarks, w, h):
     """Chỉ kiểm tra miệng để tránh MAR/ngáp giả; không ảnh hưởng trạng thái mắt."""
@@ -670,6 +498,11 @@ def assess_mouth_coverage(bgr, landmarks, w, h):
     skin_s = _roi_laplacian_var(bgr, landmarks, SKIN_REF, w, h, pad=6)
     return (mouth_s is not None and mouth_s < ROI_STRUCTURE_MIN * 0.5
             and (skin_s is None or skin_s >= ROI_STRUCTURE_MIN * 0.9))
+
+
+def is_frame_dead(bgr):
+    """Frame den tuyet doi: dau hieu handle camera hong / dang bi app khac giu."""
+    return int(bgr.max()) < CAM_DEAD_MAX_PIXEL
 
 
 def is_color_obstructed(bgr):
@@ -803,6 +636,17 @@ def log_alert(start_ts, end_ts, reasons):
 
 
 class DrowsinessApp:
+    @property
+    def status(self):
+        return self._status
+
+    @status.setter
+    def status(self, value):
+        old = getattr(self, "_status", None)
+        if value != old:
+            log.info("STATUS %s -> %s", old, value)
+        self._status = value
+
     NAV = [
         ("monitor", "◉  Giám sát"),
         ("map", "⌖  Bản đồ & lộ trình"),
@@ -818,10 +662,6 @@ class DrowsinessApp:
         self.root.configure(fg_color=T.C["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.on_exit)
 
-        self.running = False
-        self.thread = None
-        self.cap = None
-        self.landmarker = None
         self.photo = None
         self.frame_img = None
         self.frame_seq = 0
@@ -841,10 +681,8 @@ class DrowsinessApp:
         self.current_th_display = EAR_THRESHOLD_NORMAL
 
         # Watchdog / system health
-        self.last_heartbeat = 0.0
         self.system_error = False
         self.system_error_msg = ""
-        self.detect_restarts = 0
         self.camera_obstructed = False
         self._obstructed_since = None
 
@@ -868,6 +706,18 @@ class DrowsinessApp:
         self.trip = trip_session.TripSupervisor(self._trip_fix, self._trip_replan)
 
         self.ui = T.UiBridge(root)      # thread nen -> giao dien
+        self.camera = CameraManager(
+            open_retries=CAM_OPEN_RETRIES, backoff=CAM_OPEN_BACKOFF,
+            fail_reopen=CAM_FAIL_REOPEN, open_grace=HEARTBEAT_OPEN_GRACE,
+            read_fail_sleep=CAM_READ_FAIL_SLEEP)
+        self.supervisor = Supervisor(
+            self.camera, self._worker_main, on_event=self._on_supervisor_event,
+            config=SupervisorConfig(
+                heartbeat_timeout=HEARTBEAT_TIMEOUT, open_grace=HEARTBEAT_OPEN_GRACE,
+                stop_join_timeout=STOP_JOIN_TIMEOUT, restart_settle=RESTART_SETTLE_S,
+                max_restarts=MAX_DETECT_RESTARTS, stable_reset=STABLE_RUN_RESET_S))
+        self._sup_tick_started = False
+        self._exiting = False
         self.pages = {}
         self.nav_buttons = {}
         self.current_page = None
@@ -1943,48 +1793,89 @@ class DrowsinessApp:
         self.root.after(1000, self._tick_slow)
 
     # ================================================================ PHAT HIEN (giu nguyen tu v3)
-    def init_landmarker(self):
+    @property
+    def running(self):
+        """Suy ra tu Supervisor (khong con la co dung chung giua cac thread)."""
+        return self.supervisor.is_active
+
+    def _create_landmarker(self):
+        """Goi tren WORKER thread; nem exception neu loi."""
+        base = mp_tasks.BaseOptions(model_asset_path=MODEL_PATH)
+        options = mp_vision.FaceLandmarkerOptions(
+            base_options=base, running_mode=mp_vision.RunningMode.VIDEO, num_faces=1)
+        return mp_vision.FaceLandmarker.create_from_options(options)
+
+    @staticmethod
+    def _close_landmarker_quiet(lm):
         try:
-            base = mp_tasks.BaseOptions(model_asset_path=MODEL_PATH)
-            options = mp_vision.FaceLandmarkerOptions(
-                base_options=base,
-                running_mode=mp_vision.RunningMode.VIDEO,
-                num_faces=1,
-            )
-            self.landmarker = mp_vision.FaceLandmarker.create_from_options(options)
-            return True
+            lm.close()
+        except Exception as e:
+            log.warning("close_landmarker: %s", e)
+
+    def _worker_main(self, h):
+        """Chay tren WORKER thread. Worker SO HUU landmarker + camera lease cua chinh no."""
+        try:
+            landmarker = self._create_landmarker()
         except Exception as e:
             log.error("MediaPipe init failed: %s\n%s", e, traceback.format_exc())
-            self.landmarker = None
-            return False
-
-    def close_landmarker(self):
-        if self.landmarker is not None:
-            try:
-                self.landmarker.close()
-            except Exception as e:
-                log.warning("close_landmarker: %s", e)
-            self.landmarker = None
-
-    def open_camera(self):
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception as e:
-                log.warning("cap.release: %s", e)
+            h.fail("landmarker_init_failed", restartable=False,
+                   msg="Không khởi tạo được MediaPipe — xem system_errors.log.")
+            return
+        h.add_cleanup(lambda: self._close_landmarker_quiet(landmarker), "landmarker.close")
         try:
-            self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            ok = self.cap.isOpened()
-            if not ok:
-                log.error("Camera open failed (isOpened=False)")
-            return ok
+            lease = self.camera.acquire(h.id, h.should_stop, h.beat)
+        except CameraUnrecoverable as e:
+            if e.cause == "STOP_REQUESTED":
+                return
+            log.error("Camera open failed: %s", e)
+            h.fail("camera_open_failed:" + e.cause, restartable=False,
+                   msg="Không mở được camera — kiểm tra camera đã cắm và không bị ứng dụng khác dùng.")
+            return
+        h.lease = lease
+        h.add_cleanup(lambda: lease.release("worker_exit"), "camera.release")  # chay truoc landmarker.close
+        if not h.mark_running("init_ok"):
+            return
+        self.detection_loop(h, lease, landmarker)
+
+    # ---- Supervisor -> UI (chay tren main thread, trong tick) ----
+    def _ensure_supervisor_tick(self):
+        if not self._sup_tick_started:
+            self._sup_tick_started = True
+            self.root.after(SUPERVISOR_TICK_MS, self._supervisor_tick)
+
+    def _supervisor_tick(self):
+        if self._exiting:
+            return
+        try:
+            self.supervisor.tick()
         except Exception as e:
-            log.error("open_camera: %s\n%s", e, traceback.format_exc())
-            self.cap = None
-            return False
+            log.error("supervisor tick: %s\n%s", e, traceback.format_exc())
+        self.root.after(SUPERVISOR_TICK_MS, self._supervisor_tick)
+
+    def _on_supervisor_event(self, kind, info):
+        if self._exiting:
+            return
+        if kind == "running":
+            if info.get("restart"):
+                self.status = "NORMAL"
+                self.reason = ""
+                log.info("Detection restarted OK (worker %s)", info.get("worker_id"))
+            else:
+                self.advisor.start()
+                log.info("Detection started (worker %s)", info.get("worker_id"))
+        elif kind == "restarting":
+            log.warning("Attempting detection restart %d/%d (%s)",
+                        info["n"], info["max"], info["reason"])
+        elif kind == "error":
+            self.system_error = True
+            self.system_error_msg = info.get("message") or "SYSTEM ERROR - DETECTION STOPPED"
+            self.status = "SYSTEM ERROR"
+            self.reason = ""
+            if info.get("during_start"):
+                self.advisor.stop()
+                self.session_start = None
+            self._show_system_error_ui()
+            log.error("Detection stopped: %s (%s)", info.get("reason"), self.system_error_msg)
 
     # ================================================================ DIEU KHIEN
     def _fail_start(self, ui_msg, log_msg):
@@ -1999,64 +1890,48 @@ class DrowsinessApp:
             return
         self.system_error = False
         self.system_error_msg = ""
-        self.detect_restarts = 0
         self.camera_obstructed = False
         self._obstructed_since = None
         self._banner_state = None
-        self.close_landmarker()
         if not os.path.exists(MODEL_PATH):
             self._fail_start(
                 "Không tìm thấy face_landmarker.task — hãy đặt file model cạnh ứng dụng.",
                 "model file missing: %s" % MODEL_PATH)
             return
-        if not self.init_landmarker():
-            self._fail_start("Không khởi tạo được MediaPipe — xem system_errors.log.",
-                             "landmarker init failed")
+        if not self.supervisor.start():
+            self._fail_start(
+                "Luồng camera trước đó chưa dừng hẳn — hãy đợi vài giây rồi thử lại.",
+                "supervisor refused start (worker cu con song / camera con owner)")
             return
-        if not self.open_camera():
-            self.close_landmarker()
-            self._fail_start("Không mở được camera — kiểm tra camera đã cắm và không bị ứng dụng khác dùng.",
-                             "camera open failed")
-            return
-        self.running = True
-        self.last_heartbeat = time.time()
         self.session_start = time.time()
         self.session_alerts = 0
         self.status = "NORMAL"
         self.reason = ""
         self._set_running_ui(True)
-        self.thread = threading.Thread(target=self.detection_loop, daemon=True)
-        self.thread.start()
-        self.advisor.start()
         self.update_gui()
-        self._schedule_watchdog()
-        log.info("Detection started")
+        self._ensure_supervisor_tick()
+        log.info("Detection start requested")
 
     def stop(self):
         was_running = self.running
-        self.running = False
+        self.supervisor.stop("user")        # khong chan: tai nguyen duoc thu hoi sau khi worker xac nhan dung
         if not self.system_error:
             self.status = "STOPPED"
             self.reason = ""
         self.env_flag = ""
         self.camera_obstructed = False
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception as e:
-                log.warning("stop cap.release: %s", e)
-            self.cap = None
-        self.close_landmarker()
         self.advisor.stop()
         self.health_vision.reset()
         self.session_start = None
         self._set_running_ui(False)
         self._show_stopped_ui()
         if was_running:
-            log.info("Detection stopped by user")
+            log.info("Detection stop requested by user")
 
     def on_exit(self):
-        self.running = False
+        if self._exiting:
+            return
+        self._exiting = True
         try:
             self.trip.stop()          # giu trip_state.json de lan sau tiep tuc
         except Exception:
@@ -2068,88 +1943,34 @@ class DrowsinessApp:
                 self.rag_service = None
         except Exception:
             pass
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception as e:
-                log.warning("exit cap.release: %s", e)
-        self.close_landmarker()
-        log.info("App exit")
-        self.root.destroy()
+        self.supervisor.stop("exit")
+        self._exit_deadline = time.monotonic() + EXIT_JOIN_TIMEOUT
+        self._finish_exit()
 
-    def _schedule_watchdog(self):
-        """Heartbeat: detection im lang qua lau -> SYSTEM ERROR (+ restart co gioi han)."""
-        if not self.running:
-            return
+    def _finish_exit(self):
+        """Cho worker dung toi da EXIT_JOIN_TIMEOUT (poll 50 ms), roi moi destroy."""
         try:
-            if (
-                not self.system_error
-                and self.last_heartbeat > 0
-                and (time.time() - self.last_heartbeat) > HEARTBEAT_TIMEOUT
-            ):
-                log.error("Watchdog: no heartbeat for %.1fs", time.time() - self.last_heartbeat)
-                if self.detect_restarts < MAX_DETECT_RESTARTS:
-                    self.detect_restarts += 1
-                    log.warning("Attempting detection restart %d/%d",
-                                self.detect_restarts, MAX_DETECT_RESTARTS)
-                    self._try_restart_detection()
-                else:
-                    self.system_error = True
-                    self.system_error_msg = "Hệ thống phát hiện đã dừng — không nhận được hình từ camera."
-                    self.status = "SYSTEM ERROR"
-                    self.reason = ""
-                    self.running = False
-                    self._show_system_error_ui()
-                    log.error("Detection stopped permanently after max restarts")
+            self.supervisor.tick()
         except Exception as e:
-            log.error("watchdog: %s\n%s", e, traceback.format_exc())
-
-        if self.running and not self.system_error:
-            self.root.after(WATCHDOG_CHECK_MS, self._schedule_watchdog)
-
-    def _try_restart_detection(self):
-        """Restart nhẹ: đóng/mở lại camera + landmarker, start thread mới."""
-        try:
-            self.running = False
-            time.sleep(0.15)
-            self.close_landmarker()
-            if self.cap is not None:
-                try:
-                    self.cap.release()
-                except Exception as e:
-                    log.warning("restart release: %s", e)
-                self.cap = None
-            if not self.init_landmarker() or not self.open_camera():
-                self.system_error = True
-                self.system_error_msg = "SYSTEM ERROR - DETECTION STOPPED"
-                self.status = "SYSTEM ERROR"
-                log.error("Restart failed: init/camera")
-                return
-            self.running = True
-            self.last_heartbeat = time.time()
-            self.system_error = False
-            self.status = "NORMAL"
-            self.thread = threading.Thread(target=self.detection_loop, daemon=True)
-            self.thread.start()
-            log.info("Detection restarted OK")
-        except Exception as e:
-            self.system_error = True
-            self.system_error_msg = "SYSTEM ERROR - DETECTION STOPPED"
-            self.status = "SYSTEM ERROR"
-            self.running = False
-            log.error("Restart exception: %s\n%s", e, traceback.format_exc())
-
-    def detection_loop(self):
-        if self.cap is None or self.landmarker is None:
-            self.running = False
-            log.error("detection_loop: cap or landmarker is None")
+            log.error("exit tick: %s", e)
+        timed_out = time.monotonic() >= self._exit_deadline
+        if self.supervisor.is_idle() or timed_out:
+            if timed_out and not self.supervisor.is_idle():
+                log.error("EXIT_TIMEOUT: worker chua dung sau %.1fs, thoat bat chap", EXIT_JOIN_TIMEOUT)
+            log.info("App exit")
+            self.root.destroy()
             return
+        self.root.after(50, self._finish_exit)
+
+    def detection_loop(self, wh, lease, landmarker):
+        """Chay tren worker thread; h/lease/landmarker thuoc ve worker nay."""
 
         start_time = time.time()
         prev_time = time.time()
         prev_gray = None
-        fail_reads = 0
         last_camera_beep = 0.0
+        dead_since = None
+        last_reopen = 0.0
 
         eye_closed_start = None
         yawn_start = None
@@ -2174,6 +1995,7 @@ class DrowsinessApp:
         ear_smooth = 0.0
         ear_smooth_ready = False
         open_streak = 0
+        ear_open = 0.0   # mức mở mắt riêng của tài xế (học chậm)
 
         alert_active = False
         alert_start_ts = 0.0
@@ -2188,27 +2010,42 @@ class DrowsinessApp:
         eye_occ_degraded_since = None
 
         try:
-            while self.running and not self.system_error:
-                ret, frame = self.cap.read()
+            while not wh.should_stop():
+                try:
+                    ret, frame = lease.read()          # tu reconnect + beat heartbeat ben trong
+                except CameraUnrecoverable as e:
+                    log.error("Camera unrecoverable: %s", e)
+                    wh.fail("camera_unrecoverable:" + e.cause, restartable=False,
+                           msg="Hệ thống phát hiện đã dừng — không nhận được hình từ camera.")
+                    break
                 if not ret:
-                    fail_reads += 1
-                    if fail_reads >= CAM_FAIL_REOPEN:
-                        log.warning("Camera read fail x%d — reconnect", fail_reads)
-                        if self.open_camera():
-                            fail_reads = 0
-                            self.last_heartbeat = time.time()
-                        else:
-                            time.sleep(0.5)
-                    else:
-                        time.sleep(0.02)
                     continue
-                fail_reads = 0
-                self.last_heartbeat = time.time()
-
-                if not self.running or self.landmarker is None:
+                if wh.should_stop():
                     break
 
                 frame = cv2.flip(frame, 1)
+
+                # ----- Frame den keo dai: tu mo lai camera (khong can bam Dung/Bat dau) -----
+                now_dead = time.time()
+                if is_frame_dead(frame):
+                    if dead_since is None:
+                        dead_since = now_dead
+                    elif (now_dead - dead_since >= CAM_DEAD_REOPEN_AFTER
+                          and now_dead - last_reopen >= CAM_DEAD_REOPEN_COOLDOWN):
+                        last_reopen = now_dead
+                        log.warning("CAMERA_DEAD_FRAMES: frame den %.1fs, thu mo lai camera",
+                                    now_dead - dead_since)
+                        try:
+                            lease.reopen("dead_frames")
+                        except CameraUnrecoverable as e:
+                            if e.cause != "STOP_REQUESTED":
+                                log.error("Camera reopen failed: %s", e)
+                                wh.fail("camera_unrecoverable:" + e.cause, restartable=False,
+                                        msg="Hệ thống phát hiện đã dừng — không nhận được hình từ camera.")
+                            break
+                        continue
+                else:
+                    dead_since = None
 
                 # ----- Camera obstructed (che kín) -----
                 if is_frame_obstructed(frame):
@@ -2233,6 +2070,23 @@ class DrowsinessApp:
                     self._obstructed_since = None
                     self.camera_obstructed = False
                     last_camera_beep = 0.0
+
+                # ----- Che/chet keo dai: thu mo lai handle camera (cooldown), tu hoi phuc khi het van de -----
+                if (self.camera_obstructed and self._obstructed_since is not None
+                        and time.time() - self._obstructed_since >= CAM_OBSTRUCTED_REOPEN_AFTER
+                        and time.time() - last_reopen >= CAM_DEAD_REOPEN_COOLDOWN):
+                    last_reopen = time.time()
+                    log.warning("CAMERA_OBSTRUCTED_REOPEN: max=%d mean=%.1f, thu mo lai camera",
+                                int(frame.max()), float(frame.mean()))
+                    try:
+                        lease.reopen("obstructed_long")
+                    except CameraUnrecoverable as e:
+                        if e.cause != "STOP_REQUESTED":
+                            log.error("Camera reopen failed: %s", e)
+                            wh.fail("camera_unrecoverable:" + e.cause, restartable=False,
+                                    msg="Hệ thống phát hiện đã dừng — không nhận được hình từ camera.")
+                        break
+                    continue
 
                 if self.camera_obstructed:
                     # Không báo buồn ngủ; reset timer detection
@@ -2307,12 +2161,15 @@ class DrowsinessApp:
                 ts = int((time.time() - start_time) * 1000)
 
                 try:
-                    result = self.landmarker.detect_for_video(mp_image, ts)
+                    result = landmarker.detect_for_video(mp_image, ts)
                 except ValueError as e:
                     log.warning("detect_for_video ValueError: %s", e)
+                    wh.fail("detect_exception:ValueError", restartable=True, msg="SYSTEM ERROR - DETECTION STOPPED")
                     break
                 except Exception as e:
                     log.error("detect_for_video: %s\n%s", e, traceback.format_exc())
+                    wh.fail("detect_exception:" + type(e).__name__, restartable=True,
+                           msg="SYSTEM ERROR - DETECTION STOPPED")
                     break
 
                 ear_value = mar_value = pitch = yaw = 0.0
@@ -2372,7 +2229,7 @@ class DrowsinessApp:
                         right_landmarks_valid if yaw < -YAW_EXTREME else
                         left_landmarks_valid and right_landmarks_valid
                     )
-                    eye_visible = eye_occlusion_tracker.any_eye_clear
+                    eye_visible = eye_occlusion_tracker.both_eyes_clear
                     if eye_occluded:
                         eye_unreliable = True
                         env_parts.append("eye_occlusion")
@@ -2443,7 +2300,13 @@ class DrowsinessApp:
                         elif pitch > PITCH_HIGH or is_smiling:
                             current_th = EAR_THRESHOLD_STRICT
                         else:
-                            current_th = EAR_THRESHOLD_NORMAL
+                            # Mắt híp so với mắt mở của chính tài xế cũng là dấu hiệu
+                            # buồn ngủ dù EAR chưa xuống dưới ngưỡng tuyệt đối.
+                            current_th = max(EAR_THRESHOLD_NORMAL,
+                                             EAR_CLOSING_RATIO * ear_open)
+                            if not eye_unreliable and ear_smooth >= EAR_OPEN_TRACK * ear_open:
+                                ear_open += (EAR_OPEN_ALPHA * (ear_smooth - ear_open)
+                                             if ear_open else ear_smooth)
 
                     if ear_value < EAR_VERY_LOW:
                         current_th = EAR_VERY_LOW
@@ -2827,31 +2690,19 @@ class DrowsinessApp:
                 img = Image.fromarray(rgb_show).resize(
                     (640, 480), Image.Resampling.BILINEAR
                 )
-                self.frame_img = img
-                self.frame_seq += 1
+                if not wh.should_stop():
+                    self.frame_img = img
+                    self.frame_seq += 1
                 time.sleep(0.006)
 
         except Exception as e:
             log.error("detection_loop crashed: %s\n%s", e, traceback.format_exc())
-            self.system_error = True
-            self.system_error_msg = "SYSTEM ERROR - DETECTION FAILED"
-            self.status = "SYSTEM ERROR"
-            self.running = False
-            # Cập nhật UI ngay trên main thread
-            try:
-                self.ui.post(self._show_system_error_ui)
-            except Exception as ui_e:
-                log.warning("Could not schedule SYSTEM ERROR UI: %s", ui_e)
+            wh.fail("loop_crashed:%s" % type(e).__name__, restartable=False,
+                   msg="SYSTEM ERROR - DETECTION FAILED")
 
         if alert_active:
             log_alert(alert_start_ts, time.time(), alert_reasons_snap)
-
-        if self.cap is not None:
-            try:
-                self.cap.release()
-            except Exception as e:
-                log.warning("loop end release: %s", e)
-            self.cap = None
+        # KHONG release cap / gan None o day: lease + landmarker do _entry() don dep (finally)
 
     # ================================================================ CAP NHAT GIAO DIEN
     def _show_system_error_ui(self):
