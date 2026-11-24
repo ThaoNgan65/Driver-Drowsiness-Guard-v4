@@ -2,7 +2,7 @@
 
 Ứng dụng desktop (Windows) dùng camera để phát hiện dấu hiệu buồn ngủ / mệt mỏi của tài xế theo thời gian thực, kèm trợ lý an toàn (RAG + Gemini), gợi ý điểm dừng nghỉ và lập kế hoạch hành trình an toàn.
 
-> ⚠️ Ứng dụng chỉ đưa ra **cảnh báo dấu hiệu quan sát được** và khuyến nghị an toàn, **không chẩn đoán bệnh**. Mọi con số về lộ trình/thời gian chỉ là ước tính.
+> Lưu ý: Ứng dụng chỉ đưa ra **cảnh báo dấu hiệu quan sát được** và khuyến nghị an toàn, **không chẩn đoán bệnh**. Mọi con số về lộ trình/thời gian chỉ là ước tính.
 
 ---
 
