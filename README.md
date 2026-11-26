@@ -202,9 +202,9 @@ File chạy nằm trong thư mục `dist/`. Nhớ đặt `.env` (hoặc khai bá
 
 ## Bảo mật
 
-- **Không** ghi API key trực tiếp vào mã nguồn, README hay đẩy lên Git.
+- **Không** ghi API key trực tiếp vào mã nguồn.
 - Dùng `.env` (đã nằm trong `.gitignore`) hoặc biến môi trường.
-- Nếu lỡ để lộ key, hãy thu hồi và tạo key mới ngay.
+
 
 
 
